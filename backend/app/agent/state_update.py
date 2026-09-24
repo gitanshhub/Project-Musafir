@@ -318,6 +318,14 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         change_set.changed_fields.append("hotel_selection")
         change_set.new_values["hotel_selection"] = state.hotel_selection.name if state.hotel_selection else str(raw_hotel)
 
+        # Invalidate route and itinerary anchored to previous hotel
+        if state.current_route is not None and "current_route" not in change_set.invalidated_fields:
+            state.current_route = None
+            change_set.invalidated_fields.append("current_route")
+        if state.current_itinerary is not None and "current_itinerary" not in change_set.invalidated_fields:
+            state.current_itinerary = None
+            change_set.invalidated_fields.append("current_itinerary")
+
         # Stage transition: Selecting a hotel transitions workflow to PLACE_DISCOVERY
         if state.planning_stage in (PlanningStage.DISCOVERY, PlanningStage.HOTEL_SELECTION):
             state.planning_stage = PlanningStage.PLACE_DISCOVERY
@@ -359,6 +367,30 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 change_set.invalidated_fields.append("current_route")
             if state.current_itinerary is not None:
                 state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
+
+    # 4E-rem. Check remove_places change
+    if "remove_places" in updates and updates["remove_places"] is not None:
+        raw_rem_places = updates["remove_places"]
+        if not isinstance(raw_rem_places, list):
+            raw_rem_places = [raw_rem_places]
+        prev_places = [p.name for p in state.selected_places]
+        had_route = state.current_route is not None
+        had_itinerary = state.current_itinerary is not None
+        removed_any = False
+        for p_ident in raw_rem_places:
+            ident_str = str(p_ident.get("name") if isinstance(p_ident, dict) else p_ident).strip()
+            if ident_str and state.remove_place(ident_str):
+                removed_any = True
+
+        if removed_any:
+            if "selected_places" not in change_set.changed_fields:
+                change_set.changed_fields.append("selected_places")
+                change_set.previous_values["selected_places"] = prev_places
+                change_set.new_values["selected_places"] = [p.name for p in state.selected_places]
+            if had_route and "current_route" not in change_set.invalidated_fields:
+                change_set.invalidated_fields.append("current_route")
+            if had_itinerary and "current_itinerary" not in change_set.invalidated_fields:
                 change_set.invalidated_fields.append("current_itinerary")
 
     # 4F. Check rejected_places change
@@ -434,6 +466,30 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 change_set.invalidated_fields.append("current_route")
             if state.current_itinerary is not None:
                 state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
+
+    # 4H-rem. Check remove_restaurants change
+    if "remove_restaurants" in updates and updates["remove_restaurants"] is not None:
+        raw_rem_rests = updates["remove_restaurants"]
+        if not isinstance(raw_rem_rests, list):
+            raw_rem_rests = [raw_rem_rests]
+        prev_rests = [r.name for r in state.selected_restaurants]
+        had_route = state.current_route is not None
+        had_itinerary = state.current_itinerary is not None
+        removed_any = False
+        for r_ident in raw_rem_rests:
+            ident_str = str(r_ident.get("name") if isinstance(r_ident, dict) else r_ident).strip()
+            if ident_str and state.remove_restaurant(ident_str):
+                removed_any = True
+
+        if removed_any:
+            if "selected_restaurants" not in change_set.changed_fields:
+                change_set.changed_fields.append("selected_restaurants")
+                change_set.previous_values["selected_restaurants"] = prev_rests
+                change_set.new_values["selected_restaurants"] = [r.name for r in state.selected_restaurants]
+            if had_route and "current_route" not in change_set.invalidated_fields:
+                change_set.invalidated_fields.append("current_route")
+            if had_itinerary and "current_itinerary" not in change_set.invalidated_fields:
                 change_set.invalidated_fields.append("current_itinerary")
 
     # 4I. Check selected_cafes change
@@ -520,6 +576,29 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 state.current_itinerary = None
                 change_set.invalidated_fields.append("current_itinerary")
 
+    # 4K-rem. Check remove_cafes change
+    if "remove_cafes" in updates and updates["remove_cafes"] is not None:
+        raw_rem_cafes = updates["remove_cafes"]
+        if not isinstance(raw_rem_cafes, list):
+            raw_rem_cafes = [raw_rem_cafes]
+        prev_cafes = [c.name for c in state.selected_cafes]
+        had_route = state.current_route is not None
+        had_itinerary = state.current_itinerary is not None
+        removed_any = False
+        for c_ident in raw_rem_cafes:
+            ident_str = str(c_ident.get("name") if isinstance(c_ident, dict) else c_ident).strip()
+            if ident_str and state.remove_cafe(ident_str):
+                removed_any = True
+
+        if removed_any:
+            if "selected_cafes" not in change_set.changed_fields:
+                change_set.changed_fields.append("selected_cafes")
+                change_set.previous_values["selected_cafes"] = prev_cafes
+                change_set.new_values["selected_cafes"] = [c.name for c in state.selected_cafes]
+            if had_route and "current_route" not in change_set.invalidated_fields:
+                change_set.invalidated_fields.append("current_route")
+            if had_itinerary and "current_itinerary" not in change_set.invalidated_fields:
+                change_set.invalidated_fields.append("current_itinerary")
 
     # 4L. Check cuisine_preferences change
     if "cuisine_preferences" in updates and updates["cuisine_preferences"] is not None:
@@ -588,6 +667,115 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.previous_values["meal_preferences"] = dict(state.meal_preferences)
             change_set.new_values["meal_preferences"] = dict(raw_meals)
             state.meal_preferences = dict(raw_meals)
+
+    # 8B. Check add_preferences
+    if "add_preferences" in updates and updates["add_preferences"] is not None:
+        raw_add_pref = updates["add_preferences"]
+        if not isinstance(raw_add_pref, list):
+            raw_add_pref = [raw_add_pref]
+        for p in raw_add_pref:
+            if not isinstance(p, dict):
+                continue
+            cat = str(p.get("category", "")).strip().lower()
+            val = p.get("value")
+            if not cat or val is None:
+                continue
+
+            if cat in ("dietary", "dietary_preferences", "diet"):
+                val_str = str(val).strip()
+                if val_str and val_str.lower() not in [x.lower() for x in state.dietary_preferences]:
+                    if "dietary_preferences" not in change_set.changed_fields:
+                        change_set.changed_fields.append("dietary_preferences")
+                        change_set.previous_values["dietary_preferences"] = list(state.dietary_preferences)
+                    state.dietary_preferences.append(val_str)
+                    change_set.new_values["dietary_preferences"] = list(state.dietary_preferences)
+
+            elif cat in ("cuisine", "cuisine_preferences"):
+                val_str = str(val).strip()
+                if val_str and val_str.lower() not in [x.lower() for x in state.cuisine_preferences]:
+                    if "cuisine_preferences" not in change_set.changed_fields:
+                        change_set.changed_fields.append("cuisine_preferences")
+                        change_set.previous_values["cuisine_preferences"] = list(state.cuisine_preferences)
+                    state.cuisine_preferences.append(val_str)
+                    change_set.new_values["cuisine_preferences"] = list(state.cuisine_preferences)
+
+            elif cat in ("interests", "interest"):
+                val_str = str(val).strip()
+                if val_str and val_str.lower() not in [x.lower() for x in state.interests]:
+                    if "interests" not in change_set.changed_fields:
+                        change_set.changed_fields.append("interests")
+                        change_set.previous_values["interests"] = list(state.interests)
+                    state.interests.append(val_str)
+                    change_set.new_values["interests"] = list(state.interests)
+
+            elif cat in ("meal", "meal_preferences"):
+                if isinstance(val, dict):
+                    if "meal_preferences" not in change_set.changed_fields:
+                        change_set.changed_fields.append("meal_preferences")
+                        change_set.previous_values["meal_preferences"] = dict(state.meal_preferences)
+                    state.meal_preferences.update(val)
+                    change_set.new_values["meal_preferences"] = dict(state.meal_preferences)
+
+            elif cat in ("food_price", "food_price_preference", "price"):
+                val_str = str(val).strip().lower()
+                if val_str != state.food_price_preference:
+                    if "food_price_preference" not in change_set.changed_fields:
+                        change_set.changed_fields.append("food_price_preference")
+                        change_set.previous_values["food_price_preference"] = state.food_price_preference
+                    state.food_price_preference = val_str
+                    change_set.new_values["food_price_preference"] = val_str
+
+    # 8C. Check remove_preferences
+    if "remove_preferences" in updates and updates["remove_preferences"] is not None:
+        raw_rem_pref = updates["remove_preferences"]
+        if not isinstance(raw_rem_pref, list):
+            raw_rem_pref = [raw_rem_pref]
+        for p in raw_rem_pref:
+            if not isinstance(p, dict):
+                continue
+            cat = str(p.get("category", "")).strip().lower()
+            val = p.get("value")
+            if not cat or val is None:
+                continue
+
+            val_str = str(val).strip().lower()
+            if cat in ("dietary", "dietary_preferences", "diet"):
+                new_list = [x for x in state.dietary_preferences if x.strip().lower() != val_str]
+                if len(new_list) < len(state.dietary_preferences):
+                    if "dietary_preferences" not in change_set.changed_fields:
+                        change_set.changed_fields.append("dietary_preferences")
+                        change_set.previous_values["dietary_preferences"] = list(state.dietary_preferences)
+                    state.dietary_preferences = new_list
+                    change_set.new_values["dietary_preferences"] = list(state.dietary_preferences)
+
+            elif cat in ("cuisine", "cuisine_preferences"):
+                new_list = [x for x in state.cuisine_preferences if x.strip().lower() != val_str]
+                if len(new_list) < len(state.cuisine_preferences):
+                    if "cuisine_preferences" not in change_set.changed_fields:
+                        change_set.changed_fields.append("cuisine_preferences")
+                        change_set.previous_values["cuisine_preferences"] = list(state.cuisine_preferences)
+                    state.cuisine_preferences = new_list
+                    change_set.new_values["cuisine_preferences"] = list(state.cuisine_preferences)
+
+            elif cat in ("interests", "interest"):
+                new_list = [x for x in state.interests if x.strip().lower() != val_str]
+                if len(new_list) < len(state.interests):
+                    if "interests" not in change_set.changed_fields:
+                        change_set.changed_fields.append("interests")
+                        change_set.previous_values["interests"] = list(state.interests)
+                    state.interests = new_list
+                    change_set.new_values["interests"] = list(state.interests)
+
+            elif cat in ("meal", "meal_preferences"):
+                key_to_del = str(val).strip().lower()
+                if key_to_del in [k.lower() for k in state.meal_preferences]:
+                    if "meal_preferences" not in change_set.changed_fields:
+                        change_set.changed_fields.append("meal_preferences")
+                        change_set.previous_values["meal_preferences"] = dict(state.meal_preferences)
+                    state.meal_preferences = {
+                        k: v for k, v in state.meal_preferences.items() if k.lower() != key_to_del
+                    }
+                    change_set.new_values["meal_preferences"] = dict(state.meal_preferences)
 
     # Increment state_version if any changes occurred
     if change_set.has_changes():

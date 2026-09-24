@@ -16,6 +16,15 @@ from app.schemas.itinerary import (
     ItineraryRequest,
     ItineraryResponse,
 )
+from app.schemas.reference import EntityReference, VisibleItemReference
+from app.schemas.mutation import (
+    MutationType,
+    BudgetScope,
+    ResolutionConfidence,
+    MutationCommand,
+    MutationBatch,
+    SUPPORTED_TRAVEL_MODES,
+)
 
 __all__ = [
     "Hotel",
@@ -37,4 +46,12 @@ __all__ = [
     "DailyItinerary",
     "ItineraryRequest",
     "ItineraryResponse",
+    "EntityReference",
+    "VisibleItemReference",
+    "MutationType",
+    "BudgetScope",
+    "ResolutionConfidence",
+    "MutationCommand",
+    "MutationBatch",
+    "SUPPORTED_TRAVEL_MODES",
 ]

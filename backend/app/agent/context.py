@@ -26,18 +26,7 @@ class ActiveQuestion(BaseModel):
     affirmation_value: Optional[Any] = Field(None, description="Value to apply if user responds 'yes'")
 
 
-class VisibleItemReference(BaseModel):
-    """
-    Compact reference to an item displayed to the traveler on screen.
-    Supports generic ordinal/name matching across hotels, places, and restaurants.
-    """
-    index: int = Field(..., ge=1, description="1-based ordinal display position (1st, 2nd, 3rd, ...)")
-    entity_type: str = Field(..., description="'hotel' | 'place' | 'restaurant'")
-    id: str = Field(..., description="Unique entity ID (e.g., property_token, data_id, or name)")
-    name: str = Field(..., description="Human-readable name of the item")
-    price_per_night: Optional[float] = Field(None, description="Nightly price if hotel")
-    rating: Optional[float] = Field(None, description="User rating if available")
-    extra_data: Dict[str, Any] = Field(default_factory=dict, description="Sanitized payload required for selection")
+from app.schemas.reference import EntityReference, VisibleItemReference
 
 
 class ConversationContext(BaseModel):
