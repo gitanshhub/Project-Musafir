@@ -8,6 +8,8 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.hotel import Hotel
+from app.schemas.place import Place
+from app.schemas.restaurant import Restaurant
 
 
 class AgentResults(BaseModel):
@@ -15,6 +17,14 @@ class AgentResults(BaseModel):
     hotels: Optional[List[Hotel]] = Field(
         None,
         description="Structured hotel search results returned by search_hotels tool."
+    )
+    places: Optional[List[Place]] = Field(
+        None,
+        description="Structured place search results returned by search_places tool."
+    )
+    restaurants: Optional[List[Restaurant]] = Field(
+        None,
+        description="Structured restaurant search results returned by search_restaurants tool."
     )
 
 

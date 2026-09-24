@@ -26,6 +26,8 @@ class PlanningActionType(str, Enum):
     WAIT_FOR_HOTEL_SELECTION = "WAIT_FOR_HOTEL_SELECTION"
     SEARCH_PLACES = "SEARCH_PLACES"
     WAIT_FOR_PLACE_SELECTION = "WAIT_FOR_PLACE_SELECTION"
+    SEARCH_FOOD = "SEARCH_FOOD"
+    WAIT_FOR_FOOD_SELECTION = "WAIT_FOR_FOOD_SELECTION"
     OPTIMIZE_ROUTE = "OPTIMIZE_ROUTE"
     ANSWER = "ANSWER"
 
@@ -107,6 +109,20 @@ def decide_next_planning_action(
             }
             for p in state.selected_places
         ]
+        for r in state.selected_restaurants:
+            stops_payload.append({
+                "name": r.name,
+                "latitude": r.latitude,
+                "longitude": r.longitude,
+                "stop_type": "restaurant",
+            })
+        for c in state.selected_cafes:
+            stops_payload.append({
+                "name": c.name,
+                "latitude": c.latitude,
+                "longitude": c.longitude,
+                "stop_type": "cafe",
+            })
 
         return PlanningAction(
             action_type=PlanningActionType.OPTIMIZE_ROUTE,
@@ -121,14 +137,63 @@ def decide_next_planning_action(
             target_stage=PlanningStage.ROUTE_PLANNING,
         )
 
-    # 4. Place Selection & Rejection Actions
-    # CRITICAL RULE: Modifying places stays in PLACE_SELECTION; does NOT trigger routing.
+    # 4. Place & Food Selection & Rejection Actions
+    # CRITICAL RULE: Modifying places stays in PLACE_SELECTION; modifying food stays in FOOD_SELECTION; does NOT trigger routing.
     if norm_intent in ("SELECT_PLACE", "SELECT_PLACES", "REJECT_PLACE", "DESELECT_PLACE"):
         return PlanningAction(
             action_type=PlanningActionType.WAIT_FOR_PLACE_SELECTION,
             reason=f"place_updated_{norm_intent.lower()}",
             prompt_message=None,
             target_stage=PlanningStage.PLACE_SELECTION,
+        )
+
+    if norm_intent in (
+        "SELECT_FOOD",
+        "SELECT_RESTAURANT",
+        "SELECT_RESTAURANTS",
+        "SELECT_CAFE",
+        "SELECT_CAFES",
+        "REJECT_FOOD",
+        "REJECT_RESTAURANT",
+        "REJECT_CAFE",
+    ):
+        return PlanningAction(
+            action_type=PlanningActionType.WAIT_FOR_FOOD_SELECTION,
+            reason=f"food_updated_{norm_intent.lower()}",
+            prompt_message=None,
+            target_stage=PlanningStage.FOOD_SELECTION,
+        )
+
+    # 5. Food Search / Discovery Requests
+    if norm_intent in ("SEARCH_FOOD", "SEARCH_RESTAURANTS", "SEARCH_CAFES", "FIND_LUNCH", "FIND_DINNER", "DISCOVER_FOOD") or (
+        state.planning_stage == PlanningStage.FOOD_DISCOVERY
+    ):
+        category = "cafe" if "CAFE" in norm_intent else "restaurant"
+        meal = "lunch" if "LUNCH" in norm_intent else ("dinner" if "DINNER" in norm_intent else None)
+        food_query = "cafes" if category == "cafe" else "restaurants"
+        if meal:
+            food_query = f"{meal} {food_query}"
+
+        tool_args: Dict[str, Any] = {
+            "destination": state.destination,
+            "category": category,
+            "query": food_query,
+            "exclude_names": list(state.rejected_food),
+        }
+        if meal:
+            tool_args["meal_type"] = meal
+
+        if state.hotel_selection:
+            tool_args["location_anchor"] = state.hotel_selection.name
+            tool_args["latitude"] = state.hotel_selection.latitude
+            tool_args["longitude"] = state.hotel_selection.longitude
+
+        return PlanningAction(
+            action_type=PlanningActionType.SEARCH_FOOD,
+            reason="anchored_food_search",
+            tool_name="search_restaurants",
+            tool_args=tool_args,
+            target_stage=PlanningStage.FOOD_SELECTION,
         )
 
     # 5. Place Search / Discovery Requests
@@ -183,7 +248,15 @@ def decide_next_planning_action(
                 target_stage=PlanningStage.PLACE_SELECTION,
             )
 
-    # 7. Currently in PLACE_SELECTION stage
+    # 7. Currently in FOOD_SELECTION or PLACE_SELECTION stage
+    if state.planning_stage == PlanningStage.FOOD_SELECTION:
+        return PlanningAction(
+            action_type=PlanningActionType.WAIT_FOR_FOOD_SELECTION,
+            reason="in_food_selection_awaiting_user_choice",
+            prompt_message=None,
+            target_stage=PlanningStage.FOOD_SELECTION,
+        )
+
     if state.planning_stage == PlanningStage.PLACE_SELECTION:
         # Awaiting traveler to select more places or ask to build route
         return PlanningAction(

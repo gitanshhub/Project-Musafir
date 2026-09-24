@@ -17,7 +17,7 @@ from app.agent.context import get_or_create_session, get_session, save_session
 from app.agent.fast_path import resolve_fast_path, FastPathResult
 from app.agent.state_update import apply_trip_state_update, get_next_active_question
 from app.agent.planner import decide_next_planning_action, PlanningActionType
-from app.agent.tools import optimize_route_tool
+from app.agent.tools import optimize_route_tool, search_restaurants_tool
 from app.agent.loop import AgentLoop, AgentLoopError, sanitize_public_response
 from app.llm.openrouter_client import (
     LLMAuthError,
@@ -185,14 +185,15 @@ def agent_chat(
                 if item_names:
                     final_text = f"Got it — added {', '.join(item_names)} to your trip."
                 else:
-                    final_text = "Got it — added selected places to your trip."
+                    final_text = "Got it — added selections to your trip."
             else:
                 ref_name = (fp_result.reference_resolution or {}).get("name", "item")
                 final_text = f"Got it — selected {ref_name}."
 
-            # Prompt traveler regarding additional place selections or route readiness
-            if state.hotel_selection and len(state.selected_places) >= 1:
-                final_text += " You can select more places, or let me know when you're ready to build the route."
+            # Prompt traveler regarding additional place/food selections or route readiness
+            has_food = bool(state.selected_restaurants or state.selected_cafes)
+            if state.hotel_selection and (len(state.selected_places) >= 1 or has_food):
+                final_text += " You can select more stops, or let me know when you're ready to build the route."
 
             next_q = get_next_active_question(state)
             if next_q and not state.hotel_selection:
@@ -221,6 +222,64 @@ def agent_chat(
                 iterations=0,
                 state_summary=state.summary(),
                 results=None,
+                metrics=fp_metrics,
+            )
+
+        elif fp_result.intent == "SEARCH_FOOD":
+            apply_trip_state_update(state, fp_result.state_updates)
+            plan_action = decide_next_planning_action(state, context=session.conversation_context, user_intent="SEARCH_FOOD")
+            executed_tools = []
+            results = None
+            if plan_action.action_type == PlanningActionType.SEARCH_FOOD:
+                tool_args = dict(plan_action.tool_args)
+                if fp_result.reference_resolution:
+                    cat = fp_result.reference_resolution.get("category")
+                    meal = fp_result.reference_resolution.get("meal_type")
+                    anc = fp_result.reference_resolution.get("anchor")
+                    if cat:
+                        tool_args["category"] = cat
+                    if meal:
+                        tool_args["meal_type"] = meal
+                    if anc:
+                        tool_args["location_anchor"] = anc
+
+                food_res = search_restaurants_tool(trip_state=state, **tool_args)
+                if food_res.get("success"):
+                    rests = food_res.get("restaurants", [])
+                    results = {"restaurants": rests}
+                    session.conversation_context.set_visible_items("restaurant", rests)
+                    state.planning_stage = PlanningStage.FOOD_SELECTION
+                    cat_name = "cafés" if tool_args.get("category") == "cafe" else "restaurants"
+                    anc_text = f" near {tool_args['location_anchor']}" if tool_args.get("location_anchor") else ""
+                    meal_text = f" for {tool_args['meal_type']}" if tool_args.get("meal_type") else ""
+                    final_text = f"Here are {len(rests)} {cat_name}{meal_text}{anc_text}."
+                    executed_tools = ["search_restaurants"]
+                else:
+                    final_text = f"Could not find restaurants: {food_res.get('error', 'unknown error')}"
+            else:
+                final_text = plan_action.prompt_message or "Please tell me what dining options you're looking for."
+
+            final_text = sanitize_public_response(final_text)
+
+            state.messages.append({"role": "user", "content": request.message.strip()})
+            state.messages.append({"role": "assistant", "content": final_text})
+            save_session(session)
+
+            fp_metrics = {
+                "total_turn_ms": fp_duration_ms,
+                "fast_path_ms": fp_duration_ms,
+                "llm_iterations": 0,
+                "total_llm_ms": 0,
+                "tool_count": len(executed_tools),
+            }
+
+            return AgentChatResponse(
+                conversation_id=UUID(state.conversation_id),
+                response=final_text,
+                tool_calls=executed_tools,
+                iterations=0,
+                state_summary=state.summary(),
+                results=results,
                 metrics=fp_metrics,
             )
 
@@ -263,8 +322,9 @@ def agent_chat(
                     state.planning_stage = PlanningStage.ROUTE_PLANNING
                     hotel_name = state.hotel_selection.name if state.hotel_selection else "hotel"
                     dist_km = state.current_route.total_distance_meters / 1000.0
-                    stops_n = len(state.selected_places)
-                    final_text = f"I've built the optimal route for your trip from {hotel_name} covering {stops_n} places! Total travel distance is {dist_km:.1f} km."
+                    stops_n = len(state.selected_places) + len(state.selected_restaurants) + len(state.selected_cafes)
+                    stops_word = "stops" if (state.selected_restaurants or state.selected_cafes) else "places"
+                    final_text = f"I've built the optimal route for your trip from {hotel_name} covering {stops_n} {stops_word}! Total travel distance is {dist_km:.1f} km."
                     executed_tools = ["optimize_route"]
                 else:
                     final_text = f"Could not compute route: {route_res.get('error', 'unknown error')}"

@@ -353,8 +353,13 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         if added_places:
             change_set.changed_fields.append("selected_places")
             change_set.new_values["selected_places"] = [p.name for p in state.selected_places]
-            # Selecting places keeps the workflow in PLACE_SELECTION
             state.planning_stage = PlanningStage.PLACE_SELECTION
+            if state.current_route is not None:
+                state.current_route = None
+                change_set.invalidated_fields.append("current_route")
+            if state.current_itinerary is not None:
+                state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
 
     # 4F. Check rejected_places change
     if "rejected_places" in updates and updates["rejected_places"] is not None:
@@ -371,6 +376,12 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("rejected_places")
             change_set.new_values["rejected_places"] = list(state.rejected_places)
             state.planning_stage = PlanningStage.PLACE_SELECTION
+            if state.current_route is not None:
+                state.current_route = None
+                change_set.invalidated_fields.append("current_route")
+            if state.current_itinerary is not None:
+                state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
 
     # 4G. Explicit planning_stage update
     if "planning_stage" in updates and updates["planning_stage"] is not None:
@@ -418,6 +429,12 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("selected_restaurants")
             change_set.new_values["selected_restaurants"] = [r.name for r in state.selected_restaurants]
             state.planning_stage = PlanningStage.FOOD_SELECTION
+            if state.current_route is not None:
+                state.current_route = None
+                change_set.invalidated_fields.append("current_route")
+            if state.current_itinerary is not None:
+                state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
 
     # 4I. Check selected_cafes change
     if "selected_cafes" in updates and updates["selected_cafes"] is not None:
@@ -452,6 +469,12 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("selected_cafes")
             change_set.new_values["selected_cafes"] = [c.name for c in state.selected_cafes]
             state.planning_stage = PlanningStage.FOOD_SELECTION
+            if state.current_route is not None:
+                state.current_route = None
+                change_set.invalidated_fields.append("current_route")
+            if state.current_itinerary is not None:
+                state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
 
     # 4J. Check rejected_restaurants change
     if "rejected_restaurants" in updates and updates["rejected_restaurants"] is not None:
@@ -468,6 +491,12 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("rejected_restaurants")
             change_set.new_values["rejected_restaurants"] = list(state.rejected_restaurants)
             state.planning_stage = PlanningStage.FOOD_SELECTION
+            if state.current_route is not None:
+                state.current_route = None
+                change_set.invalidated_fields.append("current_route")
+            if state.current_itinerary is not None:
+                state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
 
     # 4K. Check rejected_cafes change
     if "rejected_cafes" in updates and updates["rejected_cafes"] is not None:
@@ -484,6 +513,13 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("rejected_cafes")
             change_set.new_values["rejected_cafes"] = list(state.rejected_cafes)
             state.planning_stage = PlanningStage.FOOD_SELECTION
+            if state.current_route is not None:
+                state.current_route = None
+                change_set.invalidated_fields.append("current_route")
+            if state.current_itinerary is not None:
+                state.current_itinerary = None
+                change_set.invalidated_fields.append("current_itinerary")
+
 
     # 4L. Check cuisine_preferences change
     if "cuisine_preferences" in updates and updates["cuisine_preferences"] is not None:

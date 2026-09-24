@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from app.agent.context import SessionState, ActiveQuestion, VisibleItemReference
+from app.agent.state import PlanningStage
 from app.agent.semantics import (
     parse_currency_amount,
     parse_duration_days,
@@ -76,20 +77,89 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
         )
 
     # -------------------------------------------------------------------------
+    # -0.8. Food Discovery Request Trigger
+    # -------------------------------------------------------------------------
+    food_search_patterns = [
+        r"^(?:find|show|search|recommend|suggest|get|look\s+for)\s+(?:me\s+)?(?:some\s+)?(?:good\s+|cheap\s+|veg\s+|vegetarian\s+)?(?:restaurants|cafes|cafe|places\s+to\s+eat|food|lunch|dinner|breakfast)\b",
+        r"^(?:restaurants|cafes|food|lunch|dinner|breakfast)\s+(?:near|around|along)\b",
+        r"^(?:show|find)\s+(?:cafes|restaurants|food|lunch|dinner)\b",
+        r"\b(?:find|show|search)\s+(?:lunch|dinner|breakfast|food|restaurants|cafes)\s+(?:near|along)\s+(?:my\s+|the\s+)?route\b",
+        r"\b(?:lunch|dinner|food)\s+near\s+(?:my\s+|the\s+)?route\b",
+    ]
+    if any(re.search(p, clean_lower) for p in food_search_patterns):
+        is_cafe = "cafe" in clean_lower or "coffee" in clean_lower
+        meal = "lunch" if "lunch" in clean_lower else ("dinner" if "dinner" in clean_lower else ("breakfast" if "breakfast" in clean_lower else None))
+
+        anchor = None
+        if "near hotel" in clean_lower or "near my hotel" in clean_lower or "around hotel" in clean_lower:
+            anchor = "hotel"
+        elif "near route" in clean_lower or "along route" in clean_lower or "near my route" in clean_lower or "along the route" in clean_lower:
+            anchor = "route"
+        else:
+            anchor_match = re.search(r"\b(?:near|around)\s+(?:the\s+)?([a-z0-9\s]+)$", clean_lower)
+            if anchor_match:
+                anchor = anchor_match.group(1).strip()
+
+        return FastPathResult(
+            matched=True,
+            confidence="high",
+            intent="SEARCH_FOOD",
+            state_updates={"planning_stage": PlanningStage.FOOD_DISCOVERY},
+            reference_resolution={"category": "cafe" if is_cafe else "restaurant", "meal_type": meal, "anchor": anchor},
+            explanation="User requested food or café discovery",
+        )
+
+    # -------------------------------------------------------------------------
     # -0.5. Explicit Item Rejection Trigger
     # -------------------------------------------------------------------------
-    rejection_entity = "place" if trip.hotel_selection else None
+    rejection_entity = None
+    if trip.planning_stage in {PlanningStage.FOOD_DISCOVERY, PlanningStage.FOOD_SELECTION} or ctx.visible_restaurants:
+        rejection_entity = "restaurant"
+    elif trip.hotel_selection:
+        rejection_entity = "place"
+
     rejection = ctx.resolve_item_rejection(clean_lower, entity_type=rejection_entity)
     if rejection:
         name = rejection.name if isinstance(rejection, VisibleItemReference) else str(rejection)
         item_id = rejection.id if isinstance(rejection, VisibleItemReference) else None
+
+        is_cafe = False
+        is_restaurant = False
+        if isinstance(rejection, VisibleItemReference):
+            if rejection.entity_type == "cafe" or (rejection.extra_data and "cafe" in str(rejection.extra_data.get("category", "")).lower()):
+                is_cafe = True
+            elif rejection.entity_type == "restaurant":
+                is_restaurant = True
+
+        if not is_cafe and not is_restaurant:
+            if any(c.name.lower() == name.lower() for c in trip.selected_cafes):
+                is_cafe = True
+            elif any(r.name.lower() == name.lower() for r in trip.selected_restaurants):
+                is_restaurant = True
+            elif "cafe" in clean_lower:
+                is_cafe = True
+            elif "restaurant" in clean_lower or "food" in clean_lower:
+                is_restaurant = True
+            elif trip.planning_stage in {PlanningStage.FOOD_DISCOVERY, PlanningStage.FOOD_SELECTION}:
+                is_restaurant = True
+
+        if is_cafe:
+            state_key = "rejected_cafes"
+            desc = f"User rejected cafe '{name}'"
+        elif is_restaurant:
+            state_key = "rejected_restaurants"
+            desc = f"User rejected restaurant '{name}'"
+        else:
+            state_key = "rejected_places"
+            desc = f"User rejected place '{name}'"
+
         return FastPathResult(
             matched=True,
             confidence="high",
             intent="REJECT_ITEM",
             reference_resolution={"name": name, "id": item_id} if item_id else {"name": name},
-            state_updates={"rejected_places": [name]},
-            explanation=f"User rejected place '{name}'",
+            state_updates={state_key: [name]},
+            explanation=desc,
         )
 
     # -------------------------------------------------------------------------
@@ -327,7 +397,9 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
     # -------------------------------------------------------------------------
     if ctx.visible_hotels or ctx.visible_places or ctx.visible_restaurants:
         active_entity_type = None
-        if trip.hotel_selection and ctx.visible_places:
+        if trip.planning_stage in {PlanningStage.FOOD_DISCOVERY, PlanningStage.FOOD_SELECTION} and ctx.visible_restaurants:
+            active_entity_type = "restaurant"
+        elif trip.hotel_selection and ctx.visible_places:
             active_entity_type = "place"
         elif ctx.visible_hotels and not trip.hotel_selection:
             active_entity_type = "hotel"
@@ -344,11 +416,22 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
                 for r in multi_refs if r.entity_type == "place"
             ]
             hotel_payload = next((r.extra_data or {"name": r.name} for r in multi_refs if r.entity_type == "hotel"), None)
+            restaurant_payloads = [
+                r.extra_data or {"name": r.name, "data_id": r.id}
+                for r in multi_refs if r.entity_type in {"restaurant", "cafe"}
+            ]
             updates: Dict[str, Any] = {}
             if place_payloads:
                 updates["selected_places"] = place_payloads
             if hotel_payload:
                 updates["hotel_selection"] = hotel_payload
+            if restaurant_payloads:
+                cafes = [p for p in restaurant_payloads if "cafe" in str(p.get("category", "")).lower()]
+                rests = [p for p in restaurant_payloads if "cafe" not in str(p.get("category", "")).lower()]
+                if rests:
+                    updates["selected_restaurants"] = rests
+                if cafes:
+                    updates["selected_cafes"] = cafes
 
             return FastPathResult(
                 matched=True,
@@ -374,7 +457,7 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
                     explanation=f"Selected hotel '{matched_ref.name}' (position #{matched_ref.index})",
                 )
 
-        if ctx.visible_places:
+        if ctx.visible_places and trip.planning_stage not in {PlanningStage.FOOD_DISCOVERY, PlanningStage.FOOD_SELECTION}:
             matched_ref = ctx.resolve_item_reference(clean_lower, entity_type="place")
             if matched_ref:
                 return FastPathResult(
@@ -390,14 +473,21 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
         if ctx.visible_restaurants:
             matched_ref = ctx.resolve_item_reference(clean_lower, entity_type="restaurant")
             if matched_ref:
+                is_cafe = (
+                    matched_ref.entity_type == "cafe"
+                    or (matched_ref.extra_data and "cafe" in str(matched_ref.extra_data.get("category", "")).lower())
+                    or "cafe" in clean_lower
+                )
+                field_key = "selected_cafes" if is_cafe else "selected_restaurants"
+                payload = matched_ref.extra_data or {"name": matched_ref.name, "data_id": matched_ref.id}
                 return FastPathResult(
                     matched=True,
                     confidence="high",
                     intent="SELECT_ITEM",
                     reference_resolution=matched_ref.model_dump(),
-                    state_updates={"selected_restaurants": [matched_ref.extra_data or {"name": matched_ref.name, "data_id": matched_ref.id}]},
+                    state_updates={field_key: [payload]},
                     cleared_active_question=False,
-                    explanation=f"Referenced restaurant '{matched_ref.name}' (position #{matched_ref.index})",
+                    explanation=f"Referenced {'cafe' if is_cafe else 'restaurant'} '{matched_ref.name}' (position #{matched_ref.index})",
                 )
 
     # -------------------------------------------------------------------------

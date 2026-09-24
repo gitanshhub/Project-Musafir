@@ -297,10 +297,19 @@ def search_restaurants_tool(
     destination: str,
     query: Optional[str] = None,
     category: Optional[str] = None,
+    location_anchor: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    meal_type: Optional[str] = None,
+    dietary: Optional[str] = None,
+    cuisine: Optional[str] = None,
+    price_level: Optional[str] = None,
+    exclude_names: Optional[List[str]] = None,
     limit: int = 5,
     api_key: Optional[str] = None,
+    trip_state: Optional[TripState] = None,
 ) -> Dict[str, Any]:
-    """Search for restaurants, local dining, and cafés."""
+    """Search for restaurants, local dining, and cafés with optional location anchoring and preference filtering."""
     if not destination or not destination.strip():
         return {"success": False, "error": "destination is required"}
 
@@ -308,24 +317,116 @@ def search_restaurants_tool(
         key = _get_api_key(api_key)
         effective_query = query.strip() if query and query.strip() else None
         effective_category = category.strip() if category and category.strip() else None
-        if not effective_query and not effective_category:
-            effective_query = "restaurants"
+        effective_anchor = location_anchor.strip() if location_anchor and location_anchor.strip() else None
+        effective_lat = latitude
+        effective_lng = longitude
+
+        # Inherit anchor from hotel if user mentions hotel or anchor is "hotel"
+        if trip_state and trip_state.hotel_selection:
+            hotel = trip_state.hotel_selection
+            is_hotel_query = False
+            if effective_query:
+                pattern = r'\b(?:near|around|at)\s+(?:the\s+|my\s+)?hotel\b'
+                if re.search(pattern, effective_query, flags=re.IGNORECASE):
+                    is_hotel_query = True
+                    effective_query = re.sub(pattern, f"near {hotel.name}", effective_query, flags=re.IGNORECASE)
+
+            if (effective_anchor and effective_anchor.lower() in {"hotel", "the hotel", "my hotel"}) or (
+                not effective_anchor and is_hotel_query
+            ):
+                effective_anchor = hotel.name
+                if effective_lat is None:
+                    effective_lat = hotel.latitude
+                if effective_lng is None:
+                    effective_lng = hotel.longitude
+
+        # Check if anchor matches an ordinal or name among selected places
+        if trip_state and trip_state.selected_places:
+            if effective_anchor:
+                ord_match = re.search(r'\b(first|1st|second|2nd|third|3rd|fourth|4th|last)\b', effective_anchor.lower())
+                if ord_match:
+                    word = ord_match.group(1)
+                    idx_map = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4, "last": len(trip_state.selected_places)}
+                    target_idx = idx_map.get(word)
+                    if target_idx and 1 <= target_idx <= len(trip_state.selected_places):
+                        matched_p = trip_state.selected_places[target_idx - 1]
+                        effective_anchor = matched_p.name
+                        if effective_lat is None:
+                            effective_lat = matched_p.latitude
+                        if effective_lng is None:
+                            effective_lng = matched_p.longitude
+                else:
+                    for p in trip_state.selected_places:
+                        if effective_anchor.lower() in p.name.lower() or p.name.lower() in effective_anchor.lower():
+                            effective_anchor = p.name
+                            if effective_lat is None:
+                                effective_lat = p.latitude
+                            if effective_lng is None:
+                                effective_lng = p.longitude
+                            break
+
+            # If anchor is route or along route, anchor to intermediate stop
+            if effective_anchor and any(k in effective_anchor.lower() for k in ("route", "along route", "along the route", "near route")):
+                mid_p = trip_state.selected_places[len(trip_state.selected_places) // 2]
+                effective_anchor = mid_p.name
+                if effective_lat is None:
+                    effective_lat = mid_p.latitude
+                if effective_lng is None:
+                    effective_lng = mid_p.longitude
+
+        # Consolidate exclusions from argument and state
+        combined_excludes = set()
+        if exclude_names:
+            combined_excludes.update(e.strip().lower() for e in exclude_names if e and e.strip())
+        if trip_state:
+            if trip_state.rejected_restaurants:
+                combined_excludes.update(r.strip().lower() for r in trip_state.rejected_restaurants if r and r.strip())
+            if trip_state.rejected_cafes:
+                combined_excludes.update(c.strip().lower() for c in trip_state.rejected_cafes if c and c.strip())
+
+        # Inherit preferences from state if not explicitly passed
+        effective_dietary = dietary
+        if not effective_dietary and trip_state and getattr(trip_state, "dietary_preferences", None):
+            effective_dietary = ", ".join(trip_state.dietary_preferences)
+        effective_cuisine = cuisine
+        if not effective_cuisine and trip_state and getattr(trip_state, "cuisine_preferences", None):
+            effective_cuisine = ", ".join(trip_state.cuisine_preferences)
+        effective_price = price_level
+        if not effective_price and trip_state and getattr(trip_state, "food_price_preference", None):
+            effective_price = trip_state.food_price_preference
 
         params = build_restaurant_search_params(
             destination=destination.strip(),
             category=effective_category,
             query=effective_query,
             api_key=key,
+            location_anchor=effective_anchor,
+            latitude=effective_lat,
+            longitude=effective_lng,
+            meal_type=meal_type,
+            dietary=effective_dietary,
+            cuisine=effective_cuisine,
+            price_level=effective_price,
         )
         t0 = time.perf_counter()
         raw = fetch_restaurants_from_serpapi(params)
         serpapi_time_ms = int((time.perf_counter() - t0) * 1000)
 
-        restaurants = normalize_restaurants_response(raw, limit=max(1, limit))
+        restaurants = normalize_restaurants_response(raw, limit=max(1, limit + len(combined_excludes)))
+
+        # Filter out rejected food stops
+        if combined_excludes:
+            restaurants = [
+                r for r in restaurants
+                if r.name.strip().lower() not in combined_excludes
+                and (not r.data_id or r.data_id.lower() not in combined_excludes)
+            ]
+
+        limited = restaurants[:limit]
         return {
             "success": True,
-            "count": len(restaurants),
-            "restaurants": [r.model_dump() for r in restaurants],
+            "count": len(limited),
+            "restaurants": [r.model_dump() for r in limited],
             "serpapi_time_ms": serpapi_time_ms,
         }
     except Exception as exc:
@@ -380,6 +481,14 @@ def optimize_route_tool(
                         "longitude": r.longitude,
                         "type": "restaurant",
                     })
+                for idx, c in enumerate(trip_state.selected_cafes):
+                    raw_stops.append({
+                        "id": c.data_id or f"cafe_{idx+1}",
+                        "name": c.name,
+                        "latitude": c.latitude,
+                        "longitude": c.longitude,
+                        "type": "cafe",
+                    })
                 stops = raw_stops
 
             if mode == "driving" and trip_state.travel_mode:
@@ -415,18 +524,32 @@ def optimize_route_tool(
 
 
 def generate_itinerary_tool(
-    route: Dict[str, Any],
-    trip_date: str,
+    route: Optional[Dict[str, Any]] = None,
+    trip_date: Optional[str] = None,
     start_time: str = "09:00",
     day_start_time: str = "09:00",
     day_end_time: str = "22:00",
     split_days: bool = True,
+    trip_state: Optional[TripState] = None,
 ) -> Dict[str, Any]:
     """Convert an optimized route into a day-by-day timetable with arrival, visit, and departure times."""
     try:
+        effective_route = route
+        if not effective_route and trip_state and trip_state.current_route:
+            effective_route = trip_state.current_route.model_dump()
+
+        if not effective_route:
+            return {"success": False, "error": "route (or current_route in TripState) is required"}
+
+        effective_date_str = trip_date
+        if not effective_date_str and trip_state and trip_state.trip_start_date:
+            effective_date_str = trip_state.trip_start_date.isoformat()
+        if not effective_date_str:
+            effective_date_str = date.today().isoformat()
+
         itin_req = ItineraryRequest(
-            route=OptimizedRoute(**route),
-            trip_date=date.fromisoformat(trip_date),
+            route=OptimizedRoute(**effective_route),
+            trip_date=date.fromisoformat(effective_date_str),
             start_time=start_time,
             day_start_time=day_start_time,
             day_end_time=day_end_time,
@@ -472,11 +595,11 @@ def execute_tool(
         args["api_key"] = api_key
 
     # Inject trip_state if tool accepts it
-    if "trip_state" not in args and name in {"update_trip_state", "search_places", "optimize_route"}:
+    if "trip_state" not in args and name in {"update_trip_state", "search_places", "search_restaurants", "optimize_route", "generate_itinerary"}:
         args["trip_state"] = trip_state
 
     # Inject destination from trip_state if not explicitly provided
-    if name == "search_places" and "destination" not in args and trip_state and trip_state.destination:
+    if name in {"search_places", "search_restaurants"} and "destination" not in args and trip_state and trip_state.destination:
         args["destination"] = trip_state.destination
 
     try:
@@ -694,6 +817,39 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                         "type": "integer",
                         "description": "Max restaurants to return (default 5)",
                         "default": 5,
+                    },
+                    "location_anchor": {
+                        "type": "string",
+                        "description": "Optional hotel or attraction name to anchor dining search around (e.g. 'Grand Hyatt', 'Fort Kochi')",
+                    },
+                    "latitude": {
+                        "type": "number",
+                        "description": "Optional center latitude for proximity search",
+                    },
+                    "longitude": {
+                        "type": "number",
+                        "description": "Optional center longitude for proximity search",
+                    },
+                    "meal_type": {
+                        "type": "string",
+                        "description": "Optional meal window or type (e.g. 'breakfast', 'lunch', 'dinner', 'coffee')",
+                    },
+                    "dietary": {
+                        "type": "string",
+                        "description": "Dietary requirements (e.g. 'vegetarian', 'vegan', 'jain', 'halal')",
+                    },
+                    "cuisine": {
+                        "type": "string",
+                        "description": "Cuisine style (e.g. 'South Indian', 'Kerala', 'Italian')",
+                    },
+                    "price_level": {
+                        "type": "string",
+                        "description": "Price level constraint (e.g. 'cheap', 'budget', 'mid-range')",
+                    },
+                    "exclude_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of restaurant/cafe names to exclude/skip",
                     },
                 },
                 "required": ["destination"],

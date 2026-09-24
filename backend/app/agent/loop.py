@@ -441,6 +441,24 @@ class AgentLoop:
                     if conv_ctx:
                         conv_ctx.set_visible_items("hotel", sanitized_hotels)
 
+                # Capture structured results: latest valid search_places call
+                if tool_name == "search_places" and tool_result.get("success") and not tool_result.get("discarded"):
+                    raw_places = tool_result.get("places", [])
+                    collected_results = {
+                        "places": raw_places
+                    }
+                    if conv_ctx:
+                        conv_ctx.set_visible_items("place", raw_places)
+
+                # Capture structured results: latest valid search_restaurants call
+                if tool_name == "search_restaurants" and tool_result.get("success") and not tool_result.get("discarded"):
+                    raw_restaurants = tool_result.get("restaurants", [])
+                    collected_results = {
+                        "restaurants": raw_restaurants
+                    }
+                    if conv_ctx:
+                        conv_ctx.set_visible_items("restaurant", raw_restaurants)
+
                 # Append tool result message to conversation history
                 active_messages.append({
                     "role": "tool",

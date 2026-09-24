@@ -231,10 +231,10 @@ class ConversationContext(BaseModel):
             candidates = self.visible_hotels
         elif entity_type == "place":
             candidates = self.visible_places
-        elif entity_type == "restaurant":
+        elif entity_type in ("restaurant", "cafe"):
             candidates = self.visible_restaurants
         else:
-            candidates = self.visible_places or self.visible_hotels or self.visible_restaurants
+            candidates = self.visible_restaurants or self.visible_places or self.visible_hotels
 
         if not candidates:
             return []
@@ -242,7 +242,7 @@ class ConversationContext(BaseModel):
         # Split on commas, 'and', '&', '+'
         raw_parts = re.split(r"(?:,|\band\b|&|\+)+", clean)
         cleaned_parts = []
-        filler_words = {"take", "choose", "select", "pick", "both", "all", "the", "cards", "places", "options", "stops", "hotels"}
+        filler_words = {"take", "choose", "select", "pick", "both", "all", "the", "cards", "places", "options", "stops", "hotels", "restaurants", "cafes", "dining"}
         for p in raw_parts:
             # Strip filler words from tokens
             words = [w for w in re.findall(r"\b\w+\b", p) if w not in filler_words]
@@ -315,7 +315,7 @@ class ConversationContext(BaseModel):
             return None
 
         target = match.group(1).strip()
-        target_clean = re.sub(r"\b(?:place|attraction|stop|hotel|restaurant|one)\b", "", target).strip()
+        target_clean = re.sub(r"\b(?:place|attraction|stop|hotel|restaurant|cafe|café|one)\b", "", target).strip()
 
         # 1. Try resolving through visible items
         ref = self.resolve_item_reference(target_clean or target, entity_type=entity_type)

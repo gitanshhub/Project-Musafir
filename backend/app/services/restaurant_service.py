@@ -5,27 +5,91 @@ from app.schemas.restaurant import Restaurant
 
 def build_restaurant_search_params(
     destination: str,
-    category: Optional[str],
-    query: Optional[str],
-    api_key: str,
+    category: Optional[str] = None,
+    query: Optional[str] = None,
+    api_key: str = "",
+    location_anchor: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    meal_type: Optional[str] = None,
+    dietary: Optional[str] = None,
+    cuisine: Optional[str] = None,
+    price_level: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Translate destination and culinary intent into SerpApi Google Maps parameters."""
-    parts = [destination.strip()]
-    if query and query.strip():
-        parts.append(query.strip())
-    if category and category.strip():
-        cat_clean = category.strip()
-        # Avoid repeating the category if already present in query
-        if not (query and cat_clean.lower() in query.lower()):
-            parts.append(cat_clean)
+    """Translate destination, dining intent, qualifiers, and location anchor into SerpApi Google Maps parameters."""
+    qualifiers: List[str] = []
+    if dietary and dietary.strip():
+        d_clean = dietary.strip()
+        if not (query and d_clean.lower() in query.lower()):
+            qualifiers.append(d_clean)
+    if cuisine and cuisine.strip():
+        c_clean = cuisine.strip()
+        if not (query and c_clean.lower() in query.lower()):
+            qualifiers.append(c_clean)
+    if price_level and price_level.strip():
+        p_clean = price_level.strip()
+        if p_clean.lower() in {"cheap", "budget", "inexpensive"} and not (
+            query and any(w in query.lower() for w in ("cheap", "budget", "inexpensive"))
+        ):
+            qualifiers.append("cheap")
+    if meal_type and meal_type.strip():
+        m_clean = meal_type.strip()
+        if not (query and m_clean.lower() in query.lower()):
+            qualifiers.append(m_clean)
 
-    search_query = " ".join(parts)
-    return {
+    qualifier_str = " ".join(qualifiers).strip()
+
+    if location_anchor and location_anchor.strip():
+        anchor_clean = location_anchor.strip()
+        dest_clean = destination.strip()
+        
+        # Determine base dining term
+        if query and query.strip():
+            base_term = query.strip()
+        elif category and "cafe" in category.lower():
+            base_term = "cafes"
+        elif meal_type and meal_type.lower() in {"breakfast", "brunch", "coffee"}:
+            base_term = "cafes" if meal_type.lower() == "coffee" else "restaurants"
+        else:
+            base_term = "restaurants"
+
+        if qualifier_str:
+            # Prepend qualifiers if not already in base_term
+            missing_quals = [q for q in qualifiers if q.lower() not in base_term.lower()]
+            if missing_quals:
+                base_term = f"{' '.join(missing_quals)} {base_term}"
+
+        if anchor_clean.lower() in base_term.lower():
+            search_query = base_term if dest_clean.lower() in base_term.lower() else f"{base_term}, {dest_clean}"
+        else:
+            search_query = f"{base_term} near {anchor_clean}, {dest_clean}"
+    else:
+        parts = [destination.strip()]
+        if qualifier_str:
+            parts.append(qualifier_str)
+        if query and query.strip():
+            parts.append(query.strip())
+        if category and category.strip():
+            cat_clean = category.strip()
+            # Avoid repeating the category if already present in query or qualifiers
+            if not (query and cat_clean.lower() in query.lower()) and not (
+                qualifier_str and cat_clean.lower() in qualifier_str.lower()
+            ):
+                parts.append(cat_clean)
+
+        search_query = " ".join(parts)
+
+    params: Dict[str, Any] = {
         "engine": "google_maps",
         "type": "search",
         "q": search_query,
         "api_key": api_key,
     }
+
+    if latitude is not None and longitude is not None:
+        params["ll"] = f"@{latitude},{longitude},15z"
+
+    return params
 
 
 def fetch_restaurants_from_serpapi(params: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
