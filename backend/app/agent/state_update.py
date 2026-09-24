@@ -116,6 +116,10 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 state.selected_restaurants = []
                 change_set.invalidated_fields.append("selected_restaurants")
 
+            if len(state.selected_cafes) > 0:
+                state.selected_cafes = []
+                change_set.invalidated_fields.append("selected_cafes")
+
             if state.current_route is not None:
                 state.current_route = None
                 change_set.invalidated_fields.append("current_route")
@@ -380,6 +384,126 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 state.planning_stage = target_stage
         except ValueError:
             pass
+
+    # 4H. Check selected_restaurants change (multi or single selection)
+    if "selected_restaurants" in updates and updates["selected_restaurants"] is not None:
+        raw_rests = updates["selected_restaurants"]
+        if not isinstance(raw_rests, list):
+            raw_rests = [raw_rests]
+        from app.schemas.restaurant import Restaurant
+        added_rests = []
+        for r in raw_rests:
+            rest_obj = None
+            if isinstance(r, Restaurant):
+                rest_obj = r
+            elif isinstance(r, dict):
+                try:
+                    rest_obj = Restaurant(**r)
+                except Exception:
+                    name = r.get("name") or r.get("title")
+                    if name:
+                        rest_obj = Restaurant(
+                            data_id=str(r.get("data_id") or r.get("id") or name),
+                            name=str(name),
+                            latitude=r.get("latitude"),
+                            longitude=r.get("longitude"),
+                            rating=r.get("rating"),
+                            cuisine=r.get("cuisine") or [],
+                            price_level=r.get("price_level"),
+                        )
+            if rest_obj and state.add_restaurant(rest_obj):
+                added_rests.append(rest_obj.name)
+
+        if added_rests:
+            change_set.changed_fields.append("selected_restaurants")
+            change_set.new_values["selected_restaurants"] = [r.name for r in state.selected_restaurants]
+            state.planning_stage = PlanningStage.FOOD_SELECTION
+
+    # 4I. Check selected_cafes change
+    if "selected_cafes" in updates and updates["selected_cafes"] is not None:
+        raw_cafes = updates["selected_cafes"]
+        if not isinstance(raw_cafes, list):
+            raw_cafes = [raw_cafes]
+        from app.schemas.restaurant import Restaurant
+        added_cafes = []
+        for c in raw_cafes:
+            cafe_obj = None
+            if isinstance(c, Restaurant):
+                cafe_obj = c
+            elif isinstance(c, dict):
+                try:
+                    cafe_obj = Restaurant(**c)
+                except Exception:
+                    name = c.get("name") or c.get("title")
+                    if name:
+                        cafe_obj = Restaurant(
+                            data_id=str(c.get("data_id") or c.get("id") or name),
+                            name=str(name),
+                            latitude=c.get("latitude"),
+                            longitude=c.get("longitude"),
+                            rating=c.get("rating"),
+                            cuisine=c.get("cuisine") or ["Cafe"],
+                            price_level=c.get("price_level"),
+                        )
+            if cafe_obj and state.add_cafe(cafe_obj):
+                added_cafes.append(cafe_obj.name)
+
+        if added_cafes:
+            change_set.changed_fields.append("selected_cafes")
+            change_set.new_values["selected_cafes"] = [c.name for c in state.selected_cafes]
+            state.planning_stage = PlanningStage.FOOD_SELECTION
+
+    # 4J. Check rejected_restaurants change
+    if "rejected_restaurants" in updates and updates["rejected_restaurants"] is not None:
+        raw_rej_r = updates["rejected_restaurants"]
+        if not isinstance(raw_rej_r, list):
+            raw_rej_r = [raw_rej_r]
+        newly_rejected_r = []
+        for r in raw_rej_r:
+            r_str = str(r.get("name") if isinstance(r, dict) else r).strip()
+            if r_str and state.reject_restaurant(r_str):
+                newly_rejected_r.append(r_str)
+
+        if newly_rejected_r:
+            change_set.changed_fields.append("rejected_restaurants")
+            change_set.new_values["rejected_restaurants"] = list(state.rejected_restaurants)
+            state.planning_stage = PlanningStage.FOOD_SELECTION
+
+    # 4K. Check rejected_cafes change
+    if "rejected_cafes" in updates and updates["rejected_cafes"] is not None:
+        raw_rej_c = updates["rejected_cafes"]
+        if not isinstance(raw_rej_c, list):
+            raw_rej_c = [raw_rej_c]
+        newly_rejected_c = []
+        for c in raw_rej_c:
+            c_str = str(c.get("name") if isinstance(c, dict) else c).strip()
+            if c_str and state.reject_cafe(c_str):
+                newly_rejected_c.append(c_str)
+
+        if newly_rejected_c:
+            change_set.changed_fields.append("rejected_cafes")
+            change_set.new_values["rejected_cafes"] = list(state.rejected_cafes)
+            state.planning_stage = PlanningStage.FOOD_SELECTION
+
+    # 4L. Check cuisine_preferences change
+    if "cuisine_preferences" in updates and updates["cuisine_preferences"] is not None:
+        raw_cuisines = updates["cuisine_preferences"]
+        if isinstance(raw_cuisines, list):
+            clean_cuisines = [str(c).strip() for c in raw_cuisines if str(c).strip()]
+            if clean_cuisines != state.cuisine_preferences:
+                change_set.changed_fields.append("cuisine_preferences")
+                change_set.previous_values["cuisine_preferences"] = list(state.cuisine_preferences)
+                change_set.new_values["cuisine_preferences"] = clean_cuisines
+                state.cuisine_preferences = clean_cuisines
+
+    # 4M. Check food_price_preference change
+    if "food_price_preference" in updates and updates["food_price_preference"] is not None:
+        new_price_pref = str(updates["food_price_preference"]).strip().lower()
+        if new_price_pref != state.food_price_preference:
+            change_set.changed_fields.append("food_price_preference")
+            change_set.previous_values["food_price_preference"] = state.food_price_preference
+            change_set.new_values["food_price_preference"] = new_price_pref
+            state.food_price_preference = new_price_pref
 
     # 5. Check travel_mode change
     if "travel_mode" in updates and updates["travel_mode"] is not None:

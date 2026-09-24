@@ -21,6 +21,7 @@ class PlanningStage(str, Enum):
     PLACE_DISCOVERY = "PLACE_DISCOVERY"
     PLACE_SELECTION = "PLACE_SELECTION"
     FOOD_DISCOVERY = "FOOD_DISCOVERY"
+    FOOD_SELECTION = "FOOD_SELECTION"
     ROUTE_PLANNING = "ROUTE_PLANNING"
     ITINERARY_PLANNING = "ITINERARY_PLANNING"
     READY = "READY"
@@ -98,24 +99,61 @@ class TripState(BaseModel):
     )
     selected_restaurants: List[Restaurant] = Field(
         default_factory=list,
-        description="List of selected restaurants and cafes"
+        description="List of selected restaurants"
     )
-    
+    selected_cafes: List[Restaurant] = Field(
+        default_factory=list,
+        description="List of selected cafes and coffee shops"
+    )
+    rejected_restaurants: List[str] = Field(
+        default_factory=list,
+        description="List of restaurant names or IDs rejected/skipped by user"
+    )
+    rejected_cafes: List[str] = Field(
+        default_factory=list,
+        description="List of cafe names or IDs rejected/skipped by user"
+    )
+
+    @property
+    def selected_food(self) -> List[Restaurant]:
+        """Unified collection of all selected dining places (restaurants + cafes)."""
+        return self.selected_restaurants + self.selected_cafes
+
+    @property
+    def rejected_food(self) -> List[str]:
+        """Unified list of rejected dining places."""
+        seen = set()
+        res = []
+        for item in self.rejected_restaurants + self.rejected_cafes:
+            low = item.strip().lower()
+            if low not in seen:
+                seen.add(low)
+                res.append(item.strip())
+        return res
+
     # Preferences
     dietary_preferences: List[str] = Field(
         default_factory=list,
-        description="Dietary requirements (e.g. ['vegetarian', 'vegan', 'halal'])"
+        description="Dietary requirements (e.g. ['vegetarian', 'vegan', 'halal', 'jain'])"
     )
     meal_preferences: Dict[str, str] = Field(
         default_factory=dict,
         description="Meal specific preferences (e.g. {'lunch': 'traditional thali', 'dinner': 'rooftop'})"
     )
-    
+    cuisine_preferences: List[str] = Field(
+        default_factory=list,
+        description="Preferred cuisines (e.g. ['South Indian', 'Rajasthani', 'Italian'])"
+    )
+    food_price_preference: Optional[str] = Field(
+        None,
+        description="Preferred food price level (e.g. 'cheap', 'mid-range', 'fine-dining')"
+    )
+
     # Daily schedule constraints
     start_time: str = Field("09:00", description="Start time on Day 1 (HH:MM)")
     day_start_time: str = Field("09:00", description="Standard daily morning start time (HH:MM)")
     day_end_time: str = Field("22:00", description="Daily evening wind-down time (HH:MM)")
-    
+
     # Deterministic outputs
     current_route: Optional[OptimizedRoute] = Field(
         None, description="Current optimized route computed by the route optimization engine"
@@ -191,6 +229,35 @@ class TripState(BaseModel):
             return True
         return False
 
+    def add_cafe(self, cafe: Restaurant) -> bool:
+        """
+        Adds a cafe if not already selected.
+        Returns True if added, False if duplicate.
+        """
+        for c in self.selected_cafes:
+            if (c.data_id and c.data_id == cafe.data_id) or (c.name.strip().lower() == cafe.name.strip().lower()):
+                return False
+        self.selected_cafes.append(cafe)
+        self.invalidate_itinerary()
+        return True
+
+    def remove_cafe(self, identifier: str) -> bool:
+        """
+        Removes a cafe by data_id or name.
+        Returns True if found and removed, False otherwise.
+        """
+        clean_id = identifier.strip().lower()
+        initial_len = len(self.selected_cafes)
+        self.selected_cafes = [
+            c for c in self.selected_cafes
+            if (c.data_id and c.data_id.lower() == clean_id) is False
+            and c.name.strip().lower() != clean_id
+        ]
+        if len(self.selected_cafes) < initial_len:
+            self.invalidate_itinerary()
+            return True
+        return False
+
     def reject_place(self, identifier: str) -> bool:
         """
         Marks an attraction as rejected by name or data_id, and removes it from selected_places if present.
@@ -214,10 +281,63 @@ class TripState(BaseModel):
         ]
         return len(self.rejected_places) < initial_len
 
+    def reject_restaurant(self, identifier: str) -> bool:
+        """
+        Marks a restaurant as rejected by name or data_id, and removes it from selected_restaurants if present.
+        Returns True if newly rejected, False if already in rejected_restaurants.
+        """
+        clean_id = identifier.strip().lower()
+        self.remove_restaurant(identifier)
+        for r in self.rejected_restaurants:
+            if r.strip().lower() == clean_id:
+                return False
+        self.rejected_restaurants.append(identifier.strip())
+        return True
+
+    def unreject_restaurant(self, identifier: str) -> bool:
+        """Removes a restaurant from rejected_restaurants."""
+        clean_id = identifier.strip().lower()
+        initial_len = len(self.rejected_restaurants)
+        self.rejected_restaurants = [
+            r for r in self.rejected_restaurants
+            if r.strip().lower() != clean_id
+        ]
+        return len(self.rejected_restaurants) < initial_len
+
+    def reject_cafe(self, identifier: str) -> bool:
+        """
+        Marks a cafe as rejected by name or data_id, and removes it from selected_cafes if present.
+        Returns True if newly rejected, False if already in rejected_cafes.
+        """
+        clean_id = identifier.strip().lower()
+        self.remove_cafe(identifier)
+        for c in self.rejected_cafes:
+            if c.strip().lower() == clean_id:
+                return False
+        self.rejected_cafes.append(identifier.strip())
+        return True
+
+    def unreject_cafe(self, identifier: str) -> bool:
+        """Removes a cafe from rejected_cafes."""
+        clean_id = identifier.strip().lower()
+        initial_len = len(self.rejected_cafes)
+        self.rejected_cafes = [
+            c for c in self.rejected_cafes
+            if c.strip().lower() != clean_id
+        ]
+        return len(self.rejected_cafes) < initial_len
+
+    def reject_food(self, identifier: str, is_cafe: bool = False) -> bool:
+        """Generic food rejection helper routing to cafe or restaurant rejection."""
+        if is_cafe:
+            return self.reject_cafe(identifier)
+        return self.reject_restaurant(identifier)
+
     def clear_selected_stops(self) -> None:
-        """Clears all selected places and restaurants."""
+        """Clears all selected places, restaurants, and cafes."""
         self.selected_places = []
         self.selected_restaurants = []
+        self.selected_cafes = []
         self.invalidate_itinerary()
 
     def is_ready_for_routing(self) -> bool:
@@ -227,7 +347,7 @@ class TripState(BaseModel):
         """
         has_destination = bool(self.destination and self.destination.strip())
         has_hotel = self.hotel_selection is not None and self.hotel_selection.latitude is not None
-        has_stops = (len(self.selected_places) + len(self.selected_restaurants)) >= 1
+        has_stops = (len(self.selected_places) + len(self.selected_restaurants) + len(self.selected_cafes)) >= 1
         return has_destination and has_hotel and has_stops
 
     def summary(self) -> Dict[str, Union[str, int, float, list, None]]:
@@ -245,9 +365,16 @@ class TripState(BaseModel):
             "planning_stage": self.planning_stage.value if hasattr(self.planning_stage, "value") else str(self.planning_stage),
             "places_count": len(self.selected_places),
             "restaurants_count": len(self.selected_restaurants),
+            "cafes_count": len(self.selected_cafes),
             "places": [p.name for p in self.selected_places],
             "rejected_places": list(self.rejected_places),
             "restaurants": [r.name for r in self.selected_restaurants],
+            "rejected_restaurants": list(self.rejected_restaurants),
+            "cafes": [c.name for c in self.selected_cafes],
+            "rejected_cafes": list(self.rejected_cafes),
+            "rejected_food": self.rejected_food,
+            "cuisine_preferences": list(self.cuisine_preferences),
+            "food_price_preference": self.food_price_preference,
             "travel_mode": self.travel_mode,
             "has_route": self.current_route is not None,
             "has_itinerary": self.current_itinerary is not None,
