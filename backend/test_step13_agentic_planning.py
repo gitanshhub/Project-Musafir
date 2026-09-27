@@ -49,9 +49,12 @@ class TestStep13AgenticPlanning(unittest.TestCase):
     def setUp(self):
         clear_all_sessions()
         clear_all_states()
+        self.date_patcher = patch("app.agent.semantics.get_current_date", return_value=date(2026, 9, 23))
+        self.date_patcher.start()
         self.client = TestClient(app)
 
     def tearDown(self):
+        self.date_patcher.stop()
         clear_all_sessions()
         clear_all_states()
 

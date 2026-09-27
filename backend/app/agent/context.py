@@ -83,7 +83,8 @@ class ConversationContext(BaseModel):
         """
         self.visible_result_set_id = result_set_id or str(uuid.uuid4())[:8]
         refs: List[VisibleItemReference] = []
-        for idx, item in enumerate(items, start=1):
+        for idx, raw_item in enumerate(items, start=1):
+            item = raw_item.model_dump() if hasattr(raw_item, "model_dump") else (raw_item.dict() if hasattr(raw_item, "dict") else dict(raw_item))
             ref = VisibleItemReference(
                 index=idx,
                 entity_type=entity_type,
@@ -166,6 +167,12 @@ class ConversationContext(BaseModel):
                 f"the {word} restaurant",
             }
             if clean_stripped in patterns or any(p in clean_stripped for p in [f"{word} hotel", f"{word} place", f"{word} restaurant", f"{word} one"]):
+                if f"{word} hotel" in clean_stripped and entity_type not in (None, "hotel"):
+                    continue
+                if f"{word} restaurant" in clean_stripped and entity_type not in (None, "restaurant", "cafe"):
+                    continue
+                if f"{word} place" in clean_stripped and entity_type not in (None, "place", "attraction"):
+                    continue
                 for item in candidates:
                     if item.index == idx:
                         return item

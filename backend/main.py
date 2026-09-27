@@ -3,6 +3,7 @@ import os
 from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi.responses import HTMLResponse
 import requests
 
 from app.schemas.hotel import HotelResponse, HotelDetail
@@ -75,6 +76,17 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 @app.get("/")
 def home():
     return {"message": "Travel Agent API is running"}
+
+
+@app.get("/smoke-ui", response_class=HTMLResponse, tags=["development-harness"], include_in_schema=False)
+def smoke_ui():
+    """
+    Internal development and automated smoke testing harness.
+    NOTE: The canonical product user interface is the Next.js web application (port 3000).
+    """
+    html_path = os.path.join(os.path.dirname(__file__), "app", "static", "smoke_ui.html")
+    with open(html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
 
 
 # --- HOTELS ---

@@ -21,6 +21,16 @@ from app.agent.semantics import (
     calculate_nights,
     calculate_nightly_hotel_budget,
 )
+from app.agent.extraction import extract_trip_slots, ExtractedTripSlots
+from app.agent.llm_extraction import detect_fallback_trigger, merge_fallback_slots, run_fallback
+from app.llm.openrouter_client import OpenRouterClient
+from app.agent.resolution import (
+    resolve_entity_reference,
+    resolve_budget_phrase,
+    build_entity_replacement_batch,
+    ClarificationRequest,
+    BudgetScope,
+)
 
 
 class FastPathResult(BaseModel):
@@ -34,6 +44,9 @@ class FastPathResult(BaseModel):
     reference_resolution: Optional[Dict[str, Any]] = Field(None, description="Resolved entity card reference if applicable")
     cleared_active_question: bool = Field(False, description="True if the active question has been satisfied")
     explanation: str = Field("", description="Reasoning or description of the deterministic resolution")
+    fallback_trigger: Optional[str] = None
+    fallback_succeeded: Optional[bool] = None
+    process_as_trip: Optional[bool] = None
 
 
 # Conservative regex patterns for pure informational travel questions (non-planning)
@@ -46,7 +59,11 @@ GENERAL_QUERY_PATTERNS = [
 ]
 
 
-def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResult:
+def resolve_fast_path(
+    user_message: str,
+    session: SessionState,
+    llm_client: Optional[OpenRouterClient] = None,
+) -> FastPathResult:
     """
     Evaluates user message against active session context using conservative deterministic rules.
     Returns FastPathResult with matched=True only when high confidence is established.
@@ -54,7 +71,7 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
     if not user_message or not str(user_message).strip():
         return FastPathResult(matched=False, confidence="low", intent="FALLBACK_TO_LLM")
 
-    clean = user_message.strip()
+    clean = re.sub(r"\(.*?\)", " ", user_message.strip()).strip()
     clean_lower = clean.lower()
     ctx = session.conversation_context
     trip = session.trip_state
@@ -63,8 +80,8 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
     # -1. Explicit Route Request Trigger
     # -------------------------------------------------------------------------
     route_patterns = [
-        r"^(?:build|create|generate|plan|make|optimize|show|calculate)\s+(?:the\s+|a\s+|our\s+)?(?:route|trip\s+route)\b",
-        r"^(?:build\s+route|optimize\s+route|plan\s+route|generate\s+route)\b",
+        r"^(?:build|rebuild|create|generate|plan|make|optimize|show|calculate|update|recalculate)\s+(?:the\s+|a\s+|our\s+)?(?:new\s+)?(?:route|trip\s+route)\b",
+        r"^(?:build\s+route|optimize\s+route|plan\s+route|generate\s+route|rebuild\s+route|recalculate\s+route|update\s+route)\b",
         r"^route\s+please\b",
     ]
     if any(re.search(p, clean_lower) for p in route_patterns):
@@ -75,6 +92,298 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
             state_updates={},
             explanation="User explicitly requested route construction",
         )
+
+    # -------------------------------------------------------------------------
+    # -0.9. Explicit Itinerary Request Trigger
+    # -------------------------------------------------------------------------
+    itinerary_patterns = [
+        r"^(?:build|rebuild|create|generate|plan|make|show|calculate|update)\s+(?:the\s+|a\s+|our\s+)?(?:new\s+)?(?:itinerary|schedule|timetable|daily\s+plan)\b",
+        r"^(?:build\s+itinerary|plan\s+itinerary|generate\s+itinerary|rebuild\s+itinerary|update\s+itinerary)\b",
+        r"^itinerary\s+please\b",
+    ]
+    if any(re.search(p, clean_lower) for p in itinerary_patterns):
+        return FastPathResult(
+            matched=True,
+            confidence="high",
+            intent="ITINERARY_REQUEST",
+            state_updates={},
+            explanation="User explicitly requested itinerary synthesis",
+        )
+
+    # -------------------------------------------------------------------------
+    # -0.88. Pending Clarification Answer Resolution
+    # -------------------------------------------------------------------------
+    if ctx.active_question and ctx.active_question.scope == "clarification":
+        clar_field = ctx.active_question.field
+        options = ctx.last_mentioned_entities.get("clarification_options", [])
+
+        if clar_field == "hotel":
+            resolved_hotel = None
+            ord_map = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "last": -1}
+            for w, idx in ord_map.items():
+                if re.search(rf"\b{w}\b", clean_lower):
+                    if options and (idx < len(options) or idx == -1):
+                        resolved_hotel = options[idx]
+                        break
+                    elif ctx.visible_hotels:
+                        target_card = ctx.visible_hotels[-1] if idx == -1 else next((h for h in ctx.visible_hotels if h.index == idx + 1), None)
+                        if target_card:
+                            resolved_hotel = target_card.name
+                            break
+
+            if not resolved_hotel and options:
+                stopwords = {"change", "hotel", "hotels", "place", "places", "restaurant", "restaurants", "cafe", "cafes", "the", "one", "to", "with", "instead", "switch", "choose", "pick", "take", "want", "select", "near", "property"}
+                query_tokens = [w for w in clean_lower.split() if w not in stopwords and len(w) >= 3]
+                for opt in options:
+                    opt_lower = opt.lower()
+                    if clean_lower in opt_lower or opt_lower in clean_lower:
+                        resolved_hotel = opt
+                        break
+                    if query_tokens and any(t in opt_lower for t in query_tokens):
+                        resolved_hotel = opt
+                        break
+
+            if not resolved_hotel and ctx.visible_hotels:
+                ref = ctx.resolve_item_reference(clean_lower, entity_type="hotel")
+                if ref:
+                    resolved_hotel = ref.name
+
+            if resolved_hotel:
+                hotel_payload = {"name": resolved_hotel}
+                for vh in ctx.visible_hotels:
+                    if vh.name.lower() == resolved_hotel.lower() and vh.extra_data:
+                        hotel_payload = vh.extra_data
+                        break
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="CHANGE_HOTEL",
+                    state_updates={"hotel_selection": hotel_payload},
+                    cleared_active_question=True,
+                    explanation=f"Resolved hotel clarification to '{resolved_hotel}'",
+                )
+
+        elif clar_field in {"place", "attraction"}:
+            resolved_place = None
+            ord_map = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "last": -1}
+            for w, idx in ord_map.items():
+                if re.search(rf"\b{w}\b", clean_lower):
+                    if options and (idx < len(options) or idx == -1):
+                        resolved_place = options[idx]
+                        break
+                    elif ctx.visible_places:
+                        target_card = ctx.visible_places[-1] if idx == -1 else next((p for p in ctx.visible_places if p.index == idx + 1), None)
+                        if target_card:
+                            resolved_place = target_card.name
+                            break
+
+            if not resolved_place and options:
+                stopwords = {"change", "place", "places", "attraction", "attractions", "sight", "sights", "the", "one", "to", "with", "instead", "switch", "choose", "pick", "take", "want", "select", "visit"}
+                query_tokens = [w for w in clean_lower.split() if w not in stopwords and len(w) >= 3]
+                for opt in options:
+                    opt_lower = opt.lower()
+                    if clean_lower in opt_lower or opt_lower in clean_lower:
+                        resolved_place = opt
+                        break
+                    if query_tokens and any(t in opt_lower for t in query_tokens):
+                        resolved_place = opt
+                        break
+
+            if not resolved_place and ctx.visible_places:
+                ref = ctx.resolve_item_reference(clean_lower, entity_type="place")
+                if ref:
+                    resolved_place = ref.name
+
+            if resolved_place:
+                place_payload = {"name": resolved_place}
+                for vp in ctx.visible_places:
+                    if vp.name.lower() == resolved_place.lower() and vp.extra_data:
+                        place_payload = vp.extra_data
+                        break
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="SELECT_ITEM",
+                    state_updates={"selected_places": [place_payload]},
+                    cleared_active_question=True,
+                    explanation=f"Resolved place clarification to '{resolved_place}'",
+                )
+
+        elif clar_field in {"restaurant", "cafe"}:
+            resolved_food = None
+            ord_map = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "last": -1}
+            for w, idx in ord_map.items():
+                if re.search(rf"\b{w}\b", clean_lower):
+                    if options and (idx < len(options) or idx == -1):
+                        resolved_food = options[idx]
+                        break
+                    elif ctx.visible_restaurants:
+                        target_card = ctx.visible_restaurants[-1] if idx == -1 else next((r for r in ctx.visible_restaurants if r.index == idx + 1), None)
+                        if target_card:
+                            resolved_food = target_card.name
+                            break
+
+            if not resolved_food and options:
+                stopwords = {"change", "restaurant", "restaurants", "cafe", "cafes", "food", "eat", "dining", "the", "one", "to", "with", "instead", "switch", "choose", "pick", "take", "want", "select"}
+                query_tokens = [w for w in clean_lower.split() if w not in stopwords and len(w) >= 3]
+                for opt in options:
+                    opt_lower = opt.lower()
+                    if clean_lower in opt_lower or opt_lower in clean_lower:
+                        resolved_food = opt
+                        break
+                    if query_tokens and any(t in opt_lower for t in query_tokens):
+                        resolved_food = opt
+                        break
+
+            if not resolved_food and ctx.visible_restaurants:
+                ref = ctx.resolve_item_reference(clean_lower, entity_type="restaurant")
+                if ref:
+                    resolved_food = ref.name
+
+            if resolved_food:
+                food_payload = {"name": resolved_food}
+                is_cafe = clar_field == "cafe" or "cafe" in resolved_food.lower()
+                for vr in ctx.visible_restaurants:
+                    if vr.name.lower() == resolved_food.lower() and vr.extra_data:
+                        food_payload = vr.extra_data
+                        break
+                field_key = "selected_cafes" if is_cafe else "selected_restaurants"
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="SELECT_ITEM",
+                    state_updates={field_key: [food_payload]},
+                    cleared_active_question=True,
+                    explanation=f"Resolved food clarification to '{resolved_food}'",
+                )
+
+        elif clar_field == "budget":
+            amount = ctx.last_mentioned_entities.get("clarification_amount")
+            if amount is not None:
+                if re.search(r"\b(nightly|per\s*night|night|each\s*night|/night)\b", clean_lower):
+                    return FastPathResult(
+                        matched=True,
+                        confidence="high",
+                        intent="UPDATE_BUDGET",
+                        state_updates={"hotel_budget": float(amount)},
+                        cleared_active_question=True,
+                        explanation=f"Resolved nightly hotel budget of ₹{amount:,.0f}/night",
+                    )
+                elif re.search(r"\b(hotel|total\s*hotel|for\s*hotel|hotel\s*stay)\b", clean_lower):
+                    updates = {"hotel_total_budget": float(amount)}
+                    nights = trip.number_of_nights
+                    if nights is None and trip.number_of_days and trip.number_of_days > 1:
+                        nights = trip.number_of_days - 1
+                    if nights and nights > 0:
+                        updates["hotel_budget"] = float(amount) / nights
+                    return FastPathResult(
+                        matched=True,
+                        confidence="high",
+                        intent="UPDATE_BUDGET",
+                        state_updates=updates,
+                        cleared_active_question=True,
+                        explanation=f"Resolved total hotel budget of ₹{amount:,.0f}",
+                    )
+                elif re.search(r"\b(trip|whole\s*trip|entire\s*trip|overall)\b", clean_lower):
+                    return FastPathResult(
+                        matched=True,
+                        confidence="high",
+                        intent="UPDATE_BUDGET",
+                        state_updates={"trip_budget": float(amount)},
+                        cleared_active_question=True,
+                        explanation=f"Resolved entire trip budget of ₹{amount:,.0f}",
+                    )
+
+    # -------------------------------------------------------------------------
+    # -0.87. Travel Mode Change (Stand-alone or with route rebuild)
+    # -------------------------------------------------------------------------
+    mode_match = re.search(
+        r"^(?:switch|change|set|update|make\s+it)\s+(?:travel\s+mode\s+to\s+|mode\s+to\s+|to\s+)?(driving|walking|transit|bicycling|two_wheeler|car|cab|taxi|bike)\b",
+        clean_lower
+    )
+    if mode_match:
+        raw_m = mode_match.group(1)
+        mode_map = {
+            "driving": "driving", "car": "driving", "cab": "driving", "taxi": "driving",
+            "walking": "walking",
+            "transit": "transit",
+            "bicycling": "bicycling", "bike": "two_wheeler", "two_wheeler": "two_wheeler",
+        }
+        target_mode = mode_map.get(raw_m, raw_m)
+        has_route = trip.current_route is not None
+        rebuild_route = has_route or bool(re.search(r"\b(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", clean_lower))
+        if rebuild_route:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="UPDATE_FIELD_AND_REBUILD_ROUTE",
+                state_updates={"travel_mode": target_mode},
+                explanation=f"Changed travel mode to '{target_mode}' and rebuilding route",
+            )
+        else:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="UPDATE_TRAVEL_MODE",
+                state_updates={"travel_mode": target_mode},
+                explanation=f"Changed travel mode to '{target_mode}'",
+            )
+
+    # -------------------------------------------------------------------------
+    # -0.86. Must-Visit / Required Stop Designator (Milestone 3, Batch 3)
+    # -------------------------------------------------------------------------
+    req_match = re.search(
+        r"\b(?:must\s+visit|require|make\s+(?:it\s+)?required|designate\s+as\s+required|mark\s+as\s+required|keep)\s+(.+)",
+        clean_lower
+    )
+    if req_match:
+        target_stop_raw = req_match.group(1).strip()
+        target_stop_raw = re.sub(r"\b(?:as\s+required|as\s+must-visit|please|the)\b", "", target_stop_raw).strip()
+        matching_stop = None
+        for p in trip.selected_places:
+            if p.name.lower() == target_stop_raw.lower() or target_stop_raw.lower() in p.name.lower() or p.name.lower() in target_stop_raw.lower():
+                matching_stop = p.name
+                break
+        if not matching_stop:
+            for f in trip.selected_food:
+                if f.name.lower() == target_stop_raw.lower() or target_stop_raw.lower() in f.name.lower() or f.name.lower() in target_stop_raw.lower():
+                    matching_stop = f.name
+                    break
+
+        if matching_stop:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="MARK_STOP_REQUIRED",
+                state_updates={"mark_required_stops": [matching_stop]},
+                reference_resolution={"name": matching_stop, "priority": "REQUIRED"},
+                explanation=f"Designated '{matching_stop}' as a REQUIRED / must-visit stop",
+            )
+
+    # -------------------------------------------------------------------------
+    # -0.85. Compound Mode Change + Route Rebuild Trigger
+    # -------------------------------------------------------------------------
+    if re.search(r"\b(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", clean_lower):
+        compound_mode = None
+        for kw, target_mode in [
+            ("driving", "driving"), ("drive", "driving"), ("car", "driving"), ("cab", "driving"), ("taxi", "driving"),
+            ("walking", "walking"), ("walk", "walking"),
+            ("transit", "transit"), ("train", "transit"), ("bus", "transit"), ("metro", "transit"),
+            ("two_wheeler", "two_wheeler"), ("two wheeler", "two_wheeler"), ("bike", "two_wheeler"),
+        ]:
+            if re.search(rf"\b(?:to\s+|by\s+|with\s+)?{kw}\b", clean_lower):
+                compound_mode = target_mode
+                break
+
+        if compound_mode:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="UPDATE_FIELD_AND_REBUILD_ROUTE",
+                state_updates={"travel_mode": compound_mode},
+                explanation=f"Changed travel mode to '{compound_mode}' and requested route rebuild",
+            )
+
 
     # -------------------------------------------------------------------------
     # -0.8. Food Discovery Request Trigger
@@ -153,29 +462,151 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
             state_key = "rejected_places"
             desc = f"User rejected place '{name}'"
 
+        ref_res = {"name": name, "id": item_id} if item_id else {"name": name}
+        if re.search(r"\b(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", clean_lower):
+            ref_res["rebuild_route"] = True
+
         return FastPathResult(
             matched=True,
             confidence="high",
             intent="REJECT_ITEM",
-            reference_resolution={"name": name, "id": item_id} if item_id else {"name": name},
+            reference_resolution=ref_res,
             state_updates={state_key: [name]},
             explanation=desc,
+        )
+
+    # -------------------------------------------------------------------------
+    # -0.4. Change Hotel Trigger & Compound Hotel + Duration
+    # -------------------------------------------------------------------------
+    compound_hotel_dur = re.search(
+        r"\b(?:change|switch|update)\s+(?:my\s+|the\s+)?hotel\s+to\s+([^,]+?)\s+and\s+(?:make\s+(?:it\s+)?|set\s+duration\s+to\s+)?(\d+)\s+days?\b",
+        clean_lower,
+    )
+    if compound_hotel_dur:
+        h_target = compound_hotel_dur.group(1).strip()
+        new_days = int(compound_hotel_dur.group(2))
+        h_res = resolve_entity_reference(h_target, trip, ctx, entity_type="hotel")
+        if h_res.is_ambiguous and h_res.clarification:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="CLARIFICATION",
+                reference_resolution={"clarification": h_res.clarification.model_dump()},
+                explanation="Ambiguous hotel reference in compound change",
+            )
+        h_data = h_res.resolved_entity.data if (h_res.resolved_entity and h_res.resolved_entity.data) else {"name": h_target.title()}
+        return FastPathResult(
+            matched=True,
+            confidence="high",
+            intent="COMPOUND_MUTATION",
+            state_updates={"hotel_selection": h_data, "number_of_days": new_days},
+            explanation=f"Changed hotel to '{h_data.get('name')}' and duration to {new_days} days",
+        )
+
+    change_hotel_match = re.search(r"\b(?:change|switch|update|swap)\s+(?:my\s+|the\s+)?hotel(?:\s+to\s+|\s+for\s+)(.+)", clean_lower)
+    if change_hotel_match:
+        target_hotel_str = change_hotel_match.group(1).strip()
+        rebuild_route = False
+        if re.search(r"\b(?:and\s+)?(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", target_hotel_str):
+            rebuild_route = True
+            target_hotel_str = re.sub(r"\b(?:and\s+)?(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", "", target_hotel_str).strip()
+
+        h_res = resolve_entity_reference(target_hotel_str, trip, ctx, entity_type="hotel")
+        if h_res.is_ambiguous and h_res.clarification:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="CLARIFICATION",
+                reference_resolution={"clarification": h_res.clarification.model_dump()},
+                explanation="Ambiguous hotel reference requires user clarification",
+            )
+
+        h_data = h_res.resolved_entity.data if (h_res.resolved_entity and h_res.resolved_entity.data) else {"name": target_hotel_str.title()}
+        return FastPathResult(
+            matched=True,
+            confidence="high",
+            intent="CHANGE_HOTEL",
+            state_updates={"hotel_selection": h_data},
+            reference_resolution={"hotel": h_data, "rebuild_route": rebuild_route},
+            explanation=f"Changed hotel to '{h_data.get('name')}' (rebuild_route={rebuild_route})",
+        )
+
+    # -------------------------------------------------------------------------
+    # -0.3. Entity-Specific Replacement Trigger
+    # -------------------------------------------------------------------------
+    replace_match = re.search(r"\b(?:replace|swap|substitute)\s+(.+?)\s+(?:with|for)\s+(.+)", clean_lower)
+    if replace_match:
+        orig_str = replace_match.group(1).strip()
+        new_str = replace_match.group(2).strip()
+        rebuild_route = False
+        if re.search(r"\b(?:and\s+)?(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", new_str):
+            rebuild_route = True
+            new_str = re.sub(r"\b(?:and\s+)?(?:rebuild|build|optimize|recalculate)\s+(?:the\s+)?route\b", "", new_str).strip()
+
+        target_res = resolve_entity_reference(orig_str, trip, ctx)
+        if target_res.is_ambiguous and target_res.clarification:
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="CLARIFICATION",
+                reference_resolution={"clarification": target_res.clarification.model_dump()},
+                explanation="Ambiguous replacement target requires user clarification",
+            )
+
+        if target_res.resolved_entity:
+            new_res = resolve_entity_reference(new_str, trip, ctx, entity_type=target_res.resolved_entity.entity_type)
+            new_payload = new_res.resolved_entity.data if (new_res.resolved_entity and new_res.resolved_entity.data) else {"name": new_str.title()}
+            batch = build_entity_replacement_batch(target_res.resolved_entity, new_payload, source_message=user_message)
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="REPLACE_ITEM",
+                reference_resolution={
+                    "target": target_res.resolved_entity.model_dump(),
+                    "replacement": new_payload,
+                    "batch": batch.model_dump(),
+                    "rebuild_route": rebuild_route,
+                },
+                explanation=f"Replaced {target_res.resolved_entity.name} with {new_payload.get('name')}",
+            )
+
+    # -------------------------------------------------------------------------
+    # -0.2. Dynamic Duration Modification Trigger
+    # -------------------------------------------------------------------------
+    duration_mod_match = re.search(
+        r"\b(?:make\s+(?:it\s+|the\s+trip\s+)?|reduce\s+(?:it\s+|the\s+trip\s+)?(?:to\s+|by\s+)?|add\s+|extend\s+(?:the\s+trip\s+by\s+)?|increase\s+duration\s+to\s+)(\d+|another|a|one)\s+days?\b",
+        clean_lower,
+    )
+    if duration_mod_match and trip.number_of_days is not None:
+        raw_num = duration_mod_match.group(1)
+        num = 1 if raw_num in ("another", "a", "one") else int(raw_num)
+        rebuild_itin = bool(re.search(r"\b(?:update|rebuild|generate)\s+(?:the\s+)?itinerary\b", clean_lower))
+
+        if re.search(r"\badd\b|\bextend\b", clean_lower):
+            new_days = trip.number_of_days + num
+        elif re.search(r"\breduce\s+(?:it\s+|the\s+trip\s+)?by\b", clean_lower):
+            new_days = max(1, trip.number_of_days - num)
+        else:
+            new_days = max(1, num)
+
+        return FastPathResult(
+            matched=True,
+            confidence="high",
+            intent="UPDATE_DURATION",
+            state_updates={"number_of_days": new_days},
+            reference_resolution={"rebuild_itinerary": rebuild_itin, "new_days": new_days},
+            explanation=f"Updated trip duration from {trip.number_of_days} to {new_days} days",
         )
 
     # -------------------------------------------------------------------------
     # 0. Conservative Check: Open-ended, complex, or contrastive phrases delegate to LLM
     # -------------------------------------------------------------------------
     if re.search(r"\broute\b", clean_lower):
-        return FastPathResult(
-            matched=False,
-            confidence="low",
-            intent="FALLBACK_TO_LLM",
-            explanation="Complex or nuanced route request delegates to LLM",
-        )
+        # Allow compound rebuild route if mode or replacement matched earlier
+        pass
 
     complex_nuance_patterns = [
-        r"\b(best\s+places|suggest|recommend|itinerary|somewhere|changed my mind|forget|trip under|not the|not that)\b",
-        r"\b(don't|dont|never|neither|without|except)\b",
+        r"\b(best\s+places|suggest|recommend|somewhere|changed my mind|trip under|not the|not that)\b",
     ]
     if any(re.search(p, clean_lower) for p in complex_nuance_patterns):
         return FastPathResult(
@@ -184,6 +615,137 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
             intent="FALLBACK_TO_LLM",
             explanation="Complex, nuanced, or contrastive utterance delegates to LLM",
         )
+
+    # -------------------------------------------------------------------------
+    # -0.1. Explicit & Dynamic Budget Modification Trigger
+    # -------------------------------------------------------------------------
+    dest_indicators = [r"\b(?:go\s+to|trip\s+to|travel\s+to|visiting|planning\s+a\s+trip)\b"]
+    if not any(re.search(d, clean_lower) for d in dest_indicators):
+        budget_patterns = [
+            r"\b(?:increase|decrease|change|set|make|update|reduce|raise|lower|my)\b.*\b(?:budget|hotel\s+budget|trip\s+budget|nightly|per\s+night)\b",
+            r"^(?:hotel\s+budget|trip\s+budget|budget)\b",
+            r"\b(?:budget\s+is|budget\s+of|budget\s+to)\b",
+            r"\b(?:can\s+spend|spend)\s+(?:₹|rs\.?|inr)?\s*\d+",
+            r"^(?:increase|decrease|raise|reduce|lower)\s+(?:my\s+)?budget\b",
+        ]
+        if any(re.search(bp, clean_lower) for bp in budget_patterns):
+            b_res = resolve_budget_phrase(clean_lower, trip)
+            if b_res.is_ambiguous and b_res.clarification:
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="CLARIFICATION",
+                    reference_resolution={"clarification": b_res.clarification.model_dump()},
+                    explanation="Ambiguous budget phrase requires clarification",
+                )
+            elif b_res.amount and b_res.scope:
+                field_name = {
+                    BudgetScope.NIGHTLY_HOTEL: "hotel_budget",
+                    BudgetScope.TOTAL_HOTEL: "hotel_total_budget",
+                    BudgetScope.TOTAL_TRIP: "trip_budget",
+                }[b_res.scope]
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="UPDATE_BUDGET",
+                    state_updates={field_name: b_res.amount},
+                    reference_resolution={"amount": b_res.amount, "scope": b_res.scope.value},
+                    explanation=f"Updated {field_name} to {b_res.amount}",
+                )
+
+    # -------------------------------------------------------------------------
+    # -0.05. Pure Informational Query Detector (Fast-Path Escape Hatch)
+    # -------------------------------------------------------------------------
+    for pat in GENERAL_QUERY_PATTERNS:
+        if re.search(pat, clean_lower):
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="GENERAL_TRAVEL_QUERY",
+                state_updates={},
+                cleared_active_question=False,
+                explanation="Resolved general informational query with zero state mutations",
+            )
+
+    # -------------------------------------------------------------------------
+    # 0. Multi-Slot Trip Planning & Slot Extraction (Milestone 3, M3.2)
+    # -------------------------------------------------------------------------
+    pivot_markers = [r"\binstead\b", r"\bswitch\s+to\b", r"\bforget\b", r"\bchange\s+to\b", r"\brather\b"]
+    is_pivot = any(re.search(p, clean_lower) for p in pivot_markers)
+    is_tool_search = bool(re.search(r"^(?:find|search|show|list|look\s+for)\s+(?:hotels?|places?|attractions?|restaurants?|cafes?|food)\b", clean_lower))
+
+    if is_pivot:
+        return FastPathResult(
+            matched=False,
+            confidence="low",
+            intent="FALLBACK_TO_LLM",
+            explanation="Pivot expression delegates to LLM",
+        )
+
+    if not is_tool_search:
+        extracted = extract_trip_slots(clean, trip)
+        fallback_trigger = detect_fallback_trigger(clean, extracted, trip)
+        fallback_result = None
+        if fallback_trigger and llm_client is not None:
+            fallback_result = run_fallback(clean, extracted, fallback_trigger, llm_client)
+            if fallback_result.succeeded and fallback_result.slots:
+                extracted = merge_fallback_slots(
+                    extracted,
+                    fallback_result.slots,
+                    fallback_result.suspicious_fields,
+                )
+                if fallback_result.process_as_trip is False:
+                    return FastPathResult(
+                        matched=True,
+                        confidence="high",
+                        intent="NON_TRIP_QUERY",
+                        fallback_trigger=fallback_trigger.category.value,
+                        fallback_succeeded=True,
+                        process_as_trip=False,
+                        explanation="Fallback classified the message as outside trip planning.",
+                    )
+        high_updates = extracted.high_confidence_updates()
+
+        # Check for destination corrections e.g. "Actually make it Pune, not Goa" or "Actually make it Jaipur"
+        is_correction = bool(re.search(r"\b(?:actually\s+(?:make\s+it\s+)?|make\s+it\s+|switch\s+to\s+|change\s+to\s+)[a-zA-Z]+", clean_lower))
+
+        # Check if duration correction e.g. "actually 4 days"
+        is_dur_correction = bool(re.search(r"\bactually\s+\d+", clean_lower) and "number_of_days" in high_updates)
+
+        is_multi_slot = len(extracted.explicit_fields) >= 2
+        is_slot_update = bool(
+            is_correction
+            or is_dur_correction
+            or ("dietary_preferences" in high_updates and not trip.dietary_preferences)
+            or (is_multi_slot and (not trip.destination or len(trip.messages) == 0 or is_correction))
+            or (is_multi_slot and high_updates)
+        )
+
+        if is_slot_update and high_updates:
+            if "number_of_days" in high_updates and "number_of_nights" not in high_updates:
+                high_updates["number_of_nights"] = max(0, high_updates["number_of_days"] - 1)
+                if "hotel_required" not in high_updates:
+                    high_updates["hotel_required"] = (high_updates["number_of_nights"] > 0)
+
+            high_updates["explicit_fields"] = list(extracted.explicit_fields)
+            high_updates["extracted_confidence"] = {k: v.value for k, v in extracted.confidence.items()}
+
+            cleared_q = (
+                ctx.active_question is not None
+                and ctx.active_question.field in high_updates
+            )
+
+            explanation_parts = [f"{k}={v}" for k, v in high_updates.items() if k not in ("explicit_fields", "extracted_confidence")]
+            return FastPathResult(
+                matched=True,
+                confidence="high",
+                intent="PLAN_TRIP" if ("destination" in high_updates or "number_of_days" in high_updates) else ("ANSWER_ACTIVE_QUESTION" if cleared_q else "UPDATE_FIELD"),
+                state_updates=high_updates,
+                cleared_active_question=cleared_q,
+                explanation=f"Slot extraction resolved: {', '.join(explanation_parts)}",
+                fallback_trigger=(fallback_trigger.category.value if fallback_trigger else None),
+                fallback_succeeded=(fallback_result.succeeded if fallback_result else None),
+            )
 
     # -------------------------------------------------------------------------
     # 1. High-Confidence Date Range Detection (Priority 1)
@@ -349,20 +911,23 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
         "walk": "walking", "walking": "walking",
         "bike": "two_wheeler", "motorcycle": "two_wheeler", "two wheeler": "two_wheeler",
     }
-    for kw, target_mode in mode_map.items():
-        if re.search(rf"\b{kw}\b", clean_lower):
-            cleared_q = (
-                ctx.active_question is not None
-                and (ctx.active_question.field == "travel_mode" or ctx.active_question.expected_type == "mode")
-            )
-            return FastPathResult(
-                matched=True,
-                confidence="high",
-                intent="ANSWER_ACTIVE_QUESTION" if cleared_q else "UPDATE_FIELD",
-                state_updates={"travel_mode": target_mode},
-                cleared_active_question=cleared_q,
-                explanation=f"Resolved travel mode '{target_mode}' from '{kw}'",
-            )
+    is_mode_question = (
+        ctx.active_question is not None
+        and (ctx.active_question.field == "travel_mode" or ctx.active_question.expected_type == "mode")
+    )
+    is_pure_mode_phrase = bool(re.match(r"^(?:switch\s+to\s+|change\s+to\s+|use\s+|by\s+|in\s+)?(?:" + "|".join(mode_map.keys()) + r")\b", clean_lower))
+
+    if is_mode_question or is_pure_mode_phrase:
+        for kw, target_mode in mode_map.items():
+            if re.search(rf"\b{kw}\b", clean_lower):
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="ANSWER_ACTIVE_QUESTION" if is_mode_question else "UPDATE_FIELD",
+                    state_updates={"travel_mode": target_mode},
+                    cleared_active_question=is_mode_question,
+                    explanation=f"Resolved travel mode '{target_mode}' from '{kw}'",
+                )
 
     # -------------------------------------------------------------------------
     # 6. Confirmation (Yes / No)
@@ -443,6 +1008,28 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
                 explanation=f"Selected {len(multi_refs)} items: {[r.name for r in multi_refs]}",
             )
 
+        # If user explicitly specifies restaurant or cafe, check visible restaurants first
+        if ("restaurant" in clean_lower or "cafe" in clean_lower or "food" in clean_lower) and ctx.visible_restaurants:
+            matched_ref = ctx.resolve_item_reference(clean_lower, entity_type="restaurant")
+            if matched_ref:
+                is_cafe = (
+                    matched_ref.entity_type == "cafe"
+                    or "cafe" in matched_ref.name.lower()
+                    or (matched_ref.extra_data and "cafe" in str(matched_ref.extra_data.get("category", "")).lower())
+                    or "cafe" in clean_lower
+                )
+                field_key = "selected_cafes" if is_cafe else "selected_restaurants"
+                payload = matched_ref.extra_data or {"name": matched_ref.name, "data_id": matched_ref.id}
+                return FastPathResult(
+                    matched=True,
+                    confidence="high",
+                    intent="SELECT_ITEM",
+                    reference_resolution=matched_ref.model_dump(),
+                    state_updates={field_key: [payload]},
+                    cleared_active_question=False,
+                    explanation=f"Referenced {'cafe' if is_cafe else 'restaurant'} '{matched_ref.name}' (position #{matched_ref.index})",
+                )
+
         # Check visible hotels if hotel not yet selected, or user explicitly mentions 'hotel'
         if ctx.visible_hotels and (not trip.hotel_selection or "hotel" in clean_lower):
             matched_ref = ctx.resolve_item_reference(clean_lower, entity_type="hotel")
@@ -457,7 +1044,7 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
                     explanation=f"Selected hotel '{matched_ref.name}' (position #{matched_ref.index})",
                 )
 
-        if ctx.visible_places and trip.planning_stage not in {PlanningStage.FOOD_DISCOVERY, PlanningStage.FOOD_SELECTION}:
+        if ctx.visible_places and trip.planning_stage not in {PlanningStage.FOOD_DISCOVERY, PlanningStage.FOOD_SELECTION} and not ("restaurant" in clean_lower or "cafe" in clean_lower):
             matched_ref = ctx.resolve_item_reference(clean_lower, entity_type="place")
             if matched_ref:
                 return FastPathResult(
@@ -493,13 +1080,15 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
     # -------------------------------------------------------------------------
     # 8. High-Confidence Destination Resolution
     # -------------------------------------------------------------------------
+    from app.agent.extraction import CANONICAL_DESTINATIONS
     dest_phrase_match = re.search(
-        r"^(?:i(?:'m|\s+am)?\s+(?:going|traveling|travelling|planning\s+to\s+go)\s+to|trip\s+to|heading\s+to|visiting)\s+([a-zA-Z\s]{3,30})$",
+        r"^(?:to\s+|i(?:'m|\s+am)?\s+(?:going|traveling|travelling|planning\s+to\s+go)\s+to|i\s+(?:would\s+like|want)\s+to\s+(?:visit|go\s+to|travel\s+to)|plan\s+(?:a\s+)?trip\s+to|trip\s+to|heading\s+to|visiting)\s+([a-zA-Z\s]{2,30})$",
         clean,
         re.IGNORECASE,
     )
     if dest_phrase_match:
-        extracted_dest = dest_phrase_match.group(1).strip().title()
+        raw_d = dest_phrase_match.group(1).strip()
+        extracted_dest = CANONICAL_DESTINATIONS.get(raw_d.lower(), raw_d.title())
         cleared_q = ctx.active_question is not None and ctx.active_question.field == "destination"
         return FastPathResult(
             matched=True,
@@ -520,8 +1109,9 @@ def resolve_fast_path(user_message: str, session: SessionState) -> FastPathResul
         words_in_msg = set(re.findall(r"\b[a-zA-Z]+\b", clean_lower))
         if not (words_in_msg & non_destination_keywords):
             if not parse_currency_amount(clean_lower) and not resolve_relative_date(clean_lower) and not parse_duration_days(clean_lower):
-                if re.match(r"^[a-zA-Z\s]{3,30}$", clean):
-                    extracted_dest = clean.strip().title()
+                if re.match(r"^[a-zA-Z\s]{2,30}$", clean):
+                    clean_d = re.sub(r"^(?:to|in|at)\s+", "", clean.strip(), flags=re.IGNORECASE).strip()
+                    extracted_dest = CANONICAL_DESTINATIONS.get(clean_d.lower(), clean_d.title())
                     cleared_q = ctx.active_question is not None and ctx.active_question.field == "destination"
                     return FastPathResult(
                         matched=True,

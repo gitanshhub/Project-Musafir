@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from app.agent.state import TripState
+from app.agent.dependencies import DerivedResource
 from app.agent.state_update import (
     apply_trip_state_update,
     check_trip_readiness,
@@ -109,6 +110,7 @@ def search_hotels_tool(
     max_price: Optional[float] = None,
     limit: int = 5,
     api_key: Optional[str] = None,
+    trip_state: Optional[TripState] = None,
 ) -> Dict[str, Any]:
     """Search for hotels in a destination matching budget and guest counts."""
     if not destination or not destination.strip():
@@ -147,6 +149,8 @@ def search_hotels_tool(
         hotels = normalize_hotels_response(raw, default_currency="INR")
         filtered = filter_hotels_by_budget(hotels, max_price=max_price)
         limited = filtered[:limit]
+        if trip_state:
+            trip_state.mark_derived_valid(DerivedResource.HOTEL_DISCOVERY)
 
         return {
             "success": True,
@@ -283,6 +287,9 @@ def search_places_tool(
             ]
 
         limited = places[:limit]
+        if trip_state:
+            trip_state.mark_derived_valid(DerivedResource.PLACE_DISCOVERY)
+
         return {
             "success": True,
             "count": len(limited),
@@ -423,6 +430,9 @@ def search_restaurants_tool(
             ]
 
         limited = restaurants[:limit]
+        if trip_state:
+            trip_state.mark_derived_valid(DerivedResource.FOOD_DISCOVERY)
+
         return {
             "success": True,
             "count": len(limited),
@@ -440,12 +450,15 @@ def optimize_route_tool(
     origin: Optional[Dict[str, Any]] = None,
     destination: Optional[Dict[str, Any]] = None,
     mode: str = "driving",
+    travel_mode: Optional[str] = None,
     respect_user_order: bool = False,
     api_key: Optional[str] = None,
     trip_state: Optional[TripState] = None,
 ) -> Dict[str, Any]:
     """Compute the mathematically shortest and most optimal sequence to visit a list of stops."""
     try:
+        if travel_mode:
+            mode = travel_mode
         key = _get_api_key(api_key)
 
         effective_start = start_location or origin
@@ -518,6 +531,9 @@ def optimize_route_tool(
             respect_user_order=respect_user_order,
         )
         opt_route = service_optimize_route(route_req, api_key=key)
+        if trip_state:
+            trip_state.current_route = opt_route
+            trip_state.mark_derived_valid(DerivedResource.CURRENT_ROUTE)
         return {"success": True, "route": opt_route.model_dump()}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
@@ -536,10 +552,15 @@ def generate_itinerary_tool(
     try:
         effective_route = route
         if not effective_route and trip_state and trip_state.current_route:
+            if not trip_state.is_derived_valid(DerivedResource.CURRENT_ROUTE):
+                return {
+                    "success": False,
+                    "error": "Cannot generate itinerary: current route is stale or not available. Rebuild route first.",
+                }
             effective_route = trip_state.current_route.model_dump()
 
         if not effective_route:
-            return {"success": False, "error": "route (or current_route in TripState) is required"}
+            return {"success": False, "error": "route (or valid current_route in TripState) is required"}
 
         effective_date_str = trip_date
         if not effective_date_str and trip_state and trip_state.trip_start_date:
@@ -556,7 +577,28 @@ def generate_itinerary_tool(
             split_days=split_days,
         )
         itin_res = service_generate_itinerary(itin_req)
-        return {"success": True, "itinerary": itin_res.model_dump()}
+        if trip_state:
+            trip_state.current_itinerary = itin_res
+            trip_state.mark_derived_valid(DerivedResource.CURRENT_ITINERARY)
+
+        result_payload: Dict[str, Any] = {"success": True, "itinerary": itin_res.model_dump()}
+        if trip_state and trip_state.number_of_days and itin_res.total_days > trip_state.number_of_days:
+            allocated = trip_state.number_of_days
+            unscheduled = []
+            for day in itin_res.days:
+                if day.day_number > allocated:
+                    for item in day.items:
+                        unscheduled.append(item.name)
+            result_payload["conflict"] = True
+            result_payload["allocated_days"] = allocated
+            result_payload["required_days"] = itin_res.total_days
+            result_payload["unscheduled_stops"] = unscheduled
+            result_payload["conflict_message"] = (
+                f"Your selected stops require {itin_res.total_days} days to visit comfortably, "
+                f"but your trip is set to {allocated} days. The following stops roll over past Day {allocated}: "
+                f"{', '.join(unscheduled)}. Would you like to extend your trip duration or remove some stops?"
+            )
+        return result_payload
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -595,7 +637,7 @@ def execute_tool(
         args["api_key"] = api_key
 
     # Inject trip_state if tool accepts it
-    if "trip_state" not in args and name in {"update_trip_state", "search_places", "search_restaurants", "optimize_route", "generate_itinerary"}:
+    if "trip_state" not in args and name in {"update_trip_state", "search_hotels", "search_places", "search_restaurants", "optimize_route", "generate_itinerary"}:
         args["trip_state"] = trip_state
 
     # Inject destination from trip_state if not explicitly provided

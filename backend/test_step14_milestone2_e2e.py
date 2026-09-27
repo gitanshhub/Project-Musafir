@@ -32,7 +32,13 @@ from app.schemas.route import OptimizedRoute
 class TestMilestone2E2E(unittest.TestCase):
 
     def setUp(self):
+        from datetime import date
+        self.date_patcher = patch("app.agent.semantics.get_current_date", return_value=date(2026, 9, 23))
+        self.date_patcher.start()
         self.client = TestClient(app)
+
+    def tearDown(self):
+        self.date_patcher.stop()
 
     def test_milestone_2_full_user_journey(self):
         print("\n" + "=" * 65)

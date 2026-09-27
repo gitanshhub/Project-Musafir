@@ -12,6 +12,9 @@ class Place(BaseModel):
     category: Optional[str] = None
     thumbnail: Optional[str] = None
     data_id: str
+    priority: Optional[str] = "PREFERRED"
+    is_required: bool = False
+    visit_duration_minutes: Optional[int] = 60
 
 
 class PlaceResponse(BaseModel):

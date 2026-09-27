@@ -79,12 +79,14 @@ def decide_next_planning_action(
     # ROUTE_REQUEST, BUILD_ROUTE, OPTIMIZE_ROUTE
     if norm_intent in ("ROUTE_REQUEST", "BUILD_ROUTE", "OPTIMIZE_ROUTE"):
         if not state.hotel_selection:
-            return PlanningAction(
-                action_type=PlanningActionType.ASK,
-                reason="route_requires_hotel",
-                prompt_message="Please select your starting hotel first so we can anchor the route.",
-                target_stage=PlanningStage.HOTEL_SELECTION,
-            )
+            needs_hotel = state.hotel_search_required is not False and state.hotel_required is not False and (state.number_of_nights or 0) > 0
+            if needs_hotel:
+                return PlanningAction(
+                    action_type=PlanningActionType.ASK,
+                    reason="route_requires_hotel",
+                    prompt_message="Please select your starting hotel first so we can anchor the route.",
+                    target_stage=PlanningStage.HOTEL_SELECTION,
+                )
         if len(state.selected_places) < 1:
             return PlanningAction(
                 action_type=PlanningActionType.ASK,
@@ -93,13 +95,21 @@ def decide_next_planning_action(
                 target_stage=PlanningStage.PLACE_SELECTION,
             )
 
-        # Traveler has hotel and at least 1 place -> Ready for route optimization
-        hotel = state.hotel_selection
-        origin_payload = {
-            "name": hotel.name,
-            "latitude": hotel.latitude,
-            "longitude": hotel.longitude,
-        }
+        # Traveler has hotel or day-trip first stop and at least 1 place -> Ready for route optimization
+        if state.hotel_selection:
+            hotel = state.hotel_selection
+            origin_payload = {
+                "name": hotel.name,
+                "latitude": hotel.latitude,
+                "longitude": hotel.longitude,
+            }
+        else:
+            first_p = state.selected_places[0]
+            origin_payload = {
+                "name": first_p.name,
+                "latitude": first_p.latitude,
+                "longitude": first_p.longitude,
+            }
         stops_payload = [
             {
                 "name": p.name,
@@ -124,6 +134,13 @@ def decide_next_planning_action(
                 "stop_type": "cafe",
             })
 
+        mode_is_explicit = "travel_mode" in state.explicit_fields
+        planning_assumption = None
+        if not mode_is_explicit:
+            planning_assumption = "Defaulted to driving for intra-city transit. You can switch to walking, transit, or two-wheeler anytime."
+            if planning_assumption not in state.feasibility_notes:
+                state.feasibility_notes.append(planning_assumption)
+
         return PlanningAction(
             action_type=PlanningActionType.OPTIMIZE_ROUTE,
             reason="explicit_route_intent_with_sufficient_stops",
@@ -133,6 +150,7 @@ def decide_next_planning_action(
                 "destination": origin_payload,
                 "stops": stops_payload,
                 "travel_mode": state.travel_mode or "driving",
+                "planning_assumption": planning_assumption,
             },
             target_stage=PlanningStage.ROUTE_PLANNING,
         )
@@ -268,6 +286,28 @@ def decide_next_planning_action(
 
     # 8. Hotel Search & Selection Flow
     if not state.hotel_selection:
+        # If hotel search is not required (e.g. 1-day trip / 0 nights / hotel booked separately), bypass hotel selection entirely
+        if state.hotel_search_required is False or state.hotel_required is False or (state.number_of_nights is not None and state.number_of_nights == 0):
+            if len(state.selected_places) == 0:
+                return PlanningAction(
+                    action_type=PlanningActionType.SEARCH_PLACES,
+                    reason="day_trip_no_hotel_initiate_place_discovery",
+                    tool_name="search_places",
+                    tool_args={
+                        "destination": state.destination,
+                        "query": f"top attractions in {state.destination}",
+                        "exclude_names": list(state.rejected_places),
+                    },
+                    target_stage=PlanningStage.PLACE_SELECTION,
+                )
+            else:
+                return PlanningAction(
+                    action_type=PlanningActionType.WAIT_FOR_PLACE_SELECTION,
+                    reason="day_trip_awaiting_user_place_selection",
+                    prompt_message=None,
+                    target_stage=PlanningStage.PLACE_SELECTION,
+                )
+
         # If hotels are already visible on screen, wait for selection
         if context and context.visible_hotels and len(context.visible_hotels) > 0:
             return PlanningAction(

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Musafir — Interactive Travel Agent & Replanner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: rgba(22, 30, 49, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --accent-primary: #38bdf8;
+      --accent-gradient: linear-gradient(135deg, #38bdf8, #818cf8);
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --badge-valid: #10b981;
+      --badge-stale: #f59e0b;
+      --badge-na: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; }
+    body { background-color: var(--bg); color: var(--text); min-height: 100vh; padding: 24px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--card-border); }
+    .logo { font-size: 24px; font-weight: 700; background: var(--accent-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .grid-container { display: grid; grid-template-columns: 1fr 420px; gap: 24px; max-width: 1400px; margin: 0 auto; }
+    .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 16px; backdrop-filter: blur(12px); padding: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+    .chat-box { display: flex; flex-direction: column; height: 680px; }
+    .messages-area { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; }
+    .msg.user { align-self: flex-end; background: #2563eb; color: #fff; }
+    .msg.assistant { align-self: flex-start; background: rgba(30, 41, 59, 0.9); border: 1px solid var(--card-border); }
+    .input-row { display: flex; gap: 10px; margin-top: 14px; }
+    input[type="text"] { flex: 1; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--card-border); border-radius: 10px; padding: 12px 16px; color: #fff; font-size: 14px; outline: none; }
+    input[type="text"]:focus { border-color: #38bdf8; }
+    button { background: var(--accent-gradient); border: none; border-radius: 10px; color: #fff; font-weight: 600; padding: 12px 20px; cursor: pointer; transition: opacity 0.2s; }
+    button:hover { opacity: 0.9; }
+    .quick-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .quick-btn { background: rgba(30, 41, 59, 0.8); border: 1px solid var(--card-border); color: #cbd5e1; font-size: 12px; padding: 6px 12px; border-radius: 8px; font-weight: 500; }
+    .quick-btn:hover { background: rgba(56, 189, 248, 0.15); border-color: #38bdf8; color: #38bdf8; }
+    .sidebar { display: flex; flex-direction: column; gap: 16px; }
+    .stat-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 14px; }
+    .stat-label { color: var(--text-muted); }
+    .stat-val { font-weight: 600; }
+    .badge { padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    .badge.valid { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
+    .badge.stale { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
+    .badge.not_available { background: rgba(100, 116, 139, 0.2); color: #94a3b8; border: 1px solid #64748b; }
+    .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .tag { background: rgba(56, 189, 248, 0.1); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 4px 8px; border-radius: 6px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">✦ Project Musafir — Dynamic Trip Replanner</div>
+    <div style="font-size: 13px; color: #94a3b8;">Milestone 3 Batch 2 Frontend Verification</div>
+  </div>
+
+  <div class="grid-container">
+    <div class="card chat-box">
+      <h3 style="margin-bottom: 12px; font-size: 16px; color: #e2e8f0;">Conversational Trip Planning & Replanning</h3>
+      <div id="messages-container" class="messages-area">
+        <div class="msg assistant">Welcome to Project Musafir. Tell me where you'd like to travel or click an action below to start!</div>
+      </div>
+      <div class="quick-actions">
+        <button class="quick-btn" id="btn-step-build" onclick="sendCustom('Plan a trip to Kochi for 5 days')">1. Plan Trip to Kochi</button>
+        <button class="quick-btn" id="btn-step-hotel" onclick="sendCustom('Select Grand Hyatt Kochi Bolgatty as hotel')">2. Select Grand Hyatt</button>
+        <button class="quick-btn" id="btn-step-places" onclick="sendCustom('Add Fort Kochi and Marine Drive')">3. Add Fort Kochi & Marine Drive</button>
+        <button class="quick-btn" id="btn-step-route" onclick="sendCustom('build the route')">4. Build Route</button>
+        <button class="quick-btn" id="btn-step-itin" onclick="sendCustom('generate itinerary')">5. Generate Itinerary</button>
+        <button class="quick-btn" id="btn-step-change-hotel" onclick="sendCustom('change hotel to Brunton Boatyard')">6. Swap Hotel to Brunton Boatyard</button>
+        <button class="quick-btn" id="btn-step-rebuild" onclick="sendCustom('build the route')">7. Rebuild Route (Re-anchor)</button>
+        <button class="quick-btn" id="btn-step-replace" onclick="sendCustom('replace Fort Kochi with Mattancherry Palace and rebuild the route')">8. Replace Entity</button>
+        <button class="quick-btn" id="btn-step-duration" onclick="sendCustom('make it 3 days')">9. Shorten to 3 Days</button>
+        <button class="quick-btn" id="btn-step-budget" onclick="sendCustom('hotel budget is 7000 per night')">10. Update Budget (₹7k/night)</button>
+      </div>
+      <div class="input-row">
+        <input type="text" id="chat-input" placeholder="Type a message (e.g. 'change hotel to Brunton Boatyard')..." onkeydown="if(event.key==='Enter') doSend()">
+        <button id="send-button" onclick="doSend()">Send</button>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <div class="card">
+        <h4 style="margin-bottom: 12px; font-size: 15px; color: #38bdf8;">Trip State</h4>
+        <div class="stat-row">
+          <span class="stat-label">Destination</span>
+          <span class="stat-val" id="val-dest">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Duration</span>
+          <span class="stat-val" id="val-days">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Hotel</span>
+          <span class="stat-val" id="val-hotel" style="color: #38bdf8;">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Hotel Budget</span>
+          <span class="stat-val" id="val-budget">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Selected Places</span>
+          <span class="stat-val" id="val-places-count">0</span>
+        </div>
+        <div id="places-container" class="tag-list"></div>
+        <div class="stat-row" style="margin-top: 8px;">
+          <span class="stat-label">State Version</span>
+          <span class="stat-val" id="val-version" style="color: #a78bfa;">0</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h4 style="margin-bottom: 12px; font-size: 15px; color: #38bdf8;">Derived Freshness Authority</h4>
+        <div class="stat-row">
+          <span class="stat-label">Current Route</span>
+          <span id="badge-route" class="badge not_available">not_available</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Current Itinerary</span>
+          <span id="badge-itinerary" class="badge not_available">not_available</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let conversationId = null;
+
+    async function sendCustom(msg) {
+      document.getElementById('chat-input').value = msg;
+      await doSend();
+    }
+
+    async function doSend() {
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      appendMsg('user', text);
+      input.value = '';
+
+      try {
+        const payload = { message: text };
+        if (conversationId) payload.conversation_id = conversationId;
+
+        const res = await fetch('/agent/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (data.conversation_id) conversationId = data.conversation_id;
+
+        appendMsg('assistant', data.response);
+        if (data.state_summary) {
+          updateUI(data.state_summary);
+        }
+      } catch (err) {
+        appendMsg('assistant', 'Error: ' + err.message);
+      }
+    }
+
+    function appendMsg(role, content) {
+      const cont = document.getElementById('messages-container');
+      const div = document.createElement('div');
+      div.className = 'msg ' + role;
+      div.textContent = content;
+      cont.appendChild(div);
+      cont.scrollTop = cont.scrollHeight;
+    }
+
+    function updateUI(summary) {
+      document.getElementById('val-dest').textContent = summary.destination || '—';
+      document.getElementById('val-days').textContent = summary.number_of_days ? summary.number_of_days + ' days' : '—';
+      document.getElementById('val-hotel').textContent = summary.hotel || '—';
+      document.getElementById('val-budget').textContent = summary.hotel_budget ? '₹' + summary.hotel_budget + '/night' : '—';
+      document.getElementById('val-places-count').textContent = summary.places_count || '0';
+      document.getElementById('val-version').textContent = 'v' + (summary.state_version || 0);
+
+      const pCont = document.getElementById('places-container');
+      pCont.innerHTML = '';
+      if (summary.places && summary.places.length) {
+        summary.places.forEach(p => {
+          const t = document.createElement('span');
+          t.className = 'tag';
+          t.textContent = p;
+          pCont.appendChild(t);
+        });
+      }
+
+      if (summary.derived_freshness) {
+        setBadge('badge-route', summary.derived_freshness.current_route);
+        setBadge('badge-itinerary', summary.derived_freshness.current_itinerary);
+      }
+    }
+
+    function setBadge(id, status) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.className = 'badge ' + (status || 'not_available');
+      el.textContent = status || 'not_available';
+    }
+  </script>
+</body>
+</html>

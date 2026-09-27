@@ -18,6 +18,7 @@ from app.llm.openrouter_client import OpenRouterClient, LLMResponse
 from app.llm.prompts import SYSTEM_PROMPT
 from app.agent.tools import TOOL_DEFINITIONS, execute_tool
 from app.agent.state import TripState
+from app.agent.dependencies import DerivedResource
 from app.agent.context import SessionState, ConversationContext, format_conversation_context
 from app.agent.state_update import get_next_active_question
 
@@ -85,6 +86,14 @@ def sanitize_public_response(text: Optional[str]) -> str:
     cleaned = re.sub(r"(?i)key[=:\s]+[a-zA-Z0-9_\-]+", "key=[REDACTED]", cleaned)
     # Remove Python traceback blocks
     cleaned = re.sub(r"Traceback \(most recent call last\):[\s\S]*?(?=\n\n|\Z)", "", cleaned)
+    # Remove internal derived freshness and state version leakage
+    cleaned = re.sub(
+        r"(?i)\b(?:CURRENT_ROUTE|CURRENT_ITINERARY|HOTEL_DISCOVERY|PLACE_DISCOVERY|FOOD_DISCOVERY)\s*[:=]\s*(?:VALID|STALE|NOT_AVAILABLE)\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?i)\bderived_freshness\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\bstate_version\s*[:=]\s*\d+\b", "", cleaned)
 
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
@@ -440,6 +449,8 @@ class AgentLoop:
                     }
                     if conv_ctx:
                         conv_ctx.set_visible_items("hotel", sanitized_hotels)
+                    if active_trip_state:
+                        active_trip_state.mark_derived_valid(DerivedResource.HOTEL_DISCOVERY)
 
                 # Capture structured results: latest valid search_places call
                 if tool_name == "search_places" and tool_result.get("success") and not tool_result.get("discarded"):
@@ -449,6 +460,8 @@ class AgentLoop:
                     }
                     if conv_ctx:
                         conv_ctx.set_visible_items("place", raw_places)
+                    if active_trip_state:
+                        active_trip_state.mark_derived_valid(DerivedResource.PLACE_DISCOVERY)
 
                 # Capture structured results: latest valid search_restaurants call
                 if tool_name == "search_restaurants" and tool_result.get("success") and not tool_result.get("discarded"):
@@ -458,6 +471,8 @@ class AgentLoop:
                     }
                     if conv_ctx:
                         conv_ctx.set_visible_items("restaurant", raw_restaurants)
+                    if active_trip_state:
+                        active_trip_state.mark_derived_valid(DerivedResource.FOOD_DISCOVERY)
 
                 # Append tool result message to conversation history
                 active_messages.append({

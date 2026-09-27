@@ -125,13 +125,22 @@ def parse_currency_amount(text: str) -> Optional[float]:
     # Clean text
     clean_stripped = re.sub(r"[₹$,]", "", clean)
     clean_stripped = re.sub(
-        r"\b(rs|inr|rupees|total|around|about|approx|approx\.|budget|only|per night|/night)\b",
+        r"(?:(?<=\d)|(?<=\s)|\b)(?:rs\.?|inr|rupees|total|around|about|approx|approx\.|budget|only|per night|/night)\b",
         " ",
         clean_stripped,
+        flags=re.IGNORECASE,
     )
     clean_stripped = clean_stripped.strip()
 
-    # 1. Match '5k' or '3.5k'
+    # 1. Match '1.5L' or '2 lakh' or '1 lac'
+    lakh_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:l|lac|lakh|lakhs)\b", clean_stripped)
+    if lakh_match:
+        try:
+            return float(lakh_match.group(1)) * 100000.0
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Match '5k' or '3.5k'
     k_match = re.search(r"(\d+(?:\.\d+)?)\s*k\b", clean_stripped)
     if k_match:
         try:
@@ -139,7 +148,7 @@ def parse_currency_amount(text: str) -> Optional[float]:
         except (ValueError, TypeError):
             pass
 
-    # 2. Match standard number
+    # 3. Match standard number
     num_match = re.search(r"\b(\d+(?:\.\d+)?)\b", clean_stripped)
     if num_match:
         try:
@@ -158,7 +167,7 @@ def parse_currency_amount(text: str) -> Optional[float]:
 def parse_duration_days(text: str) -> Optional[int]:
     """
     Parses duration in days from user utterance.
-    Handles '5', '5 days', '3-day', 'for 7 days', 'a week', 'weekend'.
+    Handles '5', '5 days', '3-day', 'for 7 days', 'a week', 'weekend', 'for a day'.
     CRITICAL: Never extracts dates like '24 Sept' or '24/09' as durations.
     """
     if not text or not str(text).strip():
@@ -185,6 +194,13 @@ def parse_duration_days(text: str) -> Optional[int]:
 
     if clean in {"a week", "one week", "1 week"}:
         return 7
+
+    if re.search(r"\b(?:a|1|one)\s+week\b", clean):
+        return 7
+
+    # "for a day", "for one day", "for 1 day", "just for the day", "day trip"
+    if re.search(r"\b(?:day\s+trip|single\s+day|for\s+a\s+day|for\s+one\s+day|just\s+for\s+the\s+day|for\s+1\s+day)\b", clean):
+        return 1
 
     # "X days" or "X day" or "X-day"
     days_match = re.search(r"\b(\d+)\s*[- ]*\s*days?\b", clean)
@@ -405,7 +421,7 @@ def parse_date_range(
         part1 = range_match.group(1).strip()
         part2 = range_match.group(2).strip()
         d1 = resolve_relative_date(part1, reference_date=ref, tz_name=tz_name)
-        d2 = resolve_relative_date(part2, reference_date=ref, tz_name=tz_name)
+        d2 = resolve_relative_date(part2, reference_date=d1 or ref, tz_name=tz_name)
         if d1 and d2:
             if d2 < d1:
                 # Year rollover (e.g. 28 Dec to 3 Jan)
@@ -469,4 +485,83 @@ def derive_trip_dates(
         return derived
 
     return derived
+
+
+def derive_trip_inferences(
+    state_or_data: Any,
+    explicit_fields: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Step 3 of the intelligence loop (Milestone 3, M3.2):
+    Deterministically computes anything that logically follows from raw extracted slots.
+    CRITICAL RULE: Derivation should ONLY fill in a field if it's currently empty (or not explicit).
+    Explicit information always outranks inferred information.
+    1. If duration in days is known but nights is not explicit/known:
+       nights = max(0, days - 1)
+    2. If nights == 0 and hotel_required is not explicitly set:
+       hotel_required = False
+    3. If nights > 0 and hotel_required is not explicitly set:
+       hotel_required = True
+    """
+    explicit = set(explicit_fields or [])
+    if hasattr(state_or_data, "explicit_fields"):
+        for f in state_or_data.explicit_fields:
+            explicit.add(f)
+
+    is_dict = isinstance(state_or_data, dict)
+
+    def get_val(key: str) -> Any:
+        return state_or_data.get(key) if is_dict else getattr(state_or_data, key, None)
+
+    def set_val(key: str, val: Any) -> None:
+        if is_dict:
+            state_or_data[key] = val
+        else:
+            setattr(state_or_data, key, val)
+
+    derived: Dict[str, Any] = {}
+    days = get_val("number_of_days")
+    nights = get_val("number_of_nights")
+    hotel_req = get_val("hotel_required")
+
+    # 1. Derive nights from days if nights not explicitly given
+    if days is not None and "number_of_nights" not in explicit:
+        if nights is None:
+            derived_nights = max(0, int(days) - 1)
+            set_val("number_of_nights", derived_nights)
+            derived["number_of_nights"] = derived_nights
+            nights = derived_nights
+
+    # 2. Derive accommodation semantics (Milestone 3, M3.2 Fix #1)
+    acc_req = get_val("accommodation_required")
+    if "accommodation_required" not in explicit and acc_req is None:
+        if "hotel_required" in explicit and hotel_req is not None:
+            acc_req = bool(hotel_req)
+        elif nights is not None:
+            acc_req = (int(nights) > 0)
+        elif days is not None:
+            acc_req = (int(days) > 1)
+        if acc_req is not None:
+            set_val("accommodation_required", acc_req)
+            derived["accommodation_required"] = acc_req
+
+    acc_booked = get_val("accommodation_booked")
+    if "accommodation_booked" not in explicit and acc_booked is None:
+        set_val("accommodation_booked", False)
+        derived["accommodation_booked"] = False
+
+    # Purely derived: hotel_search_required = accommodation_required and not accommodation_booked
+    is_acc_req = bool(get_val("accommodation_required"))
+    is_acc_booked = bool(get_val("accommodation_booked"))
+    hotel_search_req = is_acc_req and not is_acc_booked
+    set_val("hotel_search_required", hotel_search_req)
+    derived["hotel_search_required"] = hotel_search_req
+
+    # Legacy hotel_required mirrors hotel_search_required for backward compatibility
+    if "hotel_required" not in explicit:
+        set_val("hotel_required", hotel_search_req)
+        derived["hotel_required"] = hotel_search_req
+
+    return derived
+
 

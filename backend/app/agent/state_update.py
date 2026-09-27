@@ -13,8 +13,11 @@ from app.agent.semantics import (
     calculate_nights,
     calculate_nightly_hotel_budget,
     derive_trip_dates,
+    derive_trip_inferences,
 )
 from app.agent.context import ActiveQuestion
+from app.agent.dependencies import DerivedResource, get_invalidated_resources
+from app.agent.freshness import FreshnessRegistry, DerivedStateStatus
 
 
 class TripChangeSet(BaseModel):
@@ -93,6 +96,16 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
     if not updates or not isinstance(updates, dict):
         return change_set
 
+    # Synchronize derived_freshness if route or itinerary was assigned directly without marking
+    if state.current_route is not None and state.get_derived_status(DerivedResource.CURRENT_ROUTE) == DerivedStateStatus.NOT_AVAILABLE:
+        state.mark_derived_valid(DerivedResource.CURRENT_ROUTE)
+    if state.current_itinerary is not None and state.get_derived_status(DerivedResource.CURRENT_ITINERARY) == DerivedStateStatus.NOT_AVAILABLE:
+        state.mark_derived_valid(DerivedResource.CURRENT_ITINERARY)
+
+    # Track pre-mutation derived resource presence for accurate change reporting
+    had_route = state.current_route is not None
+    had_itinerary = state.current_itinerary is not None
+
     # 1. Check destination change
     if "destination" in updates and updates["destination"] is not None:
         new_dest = str(updates["destination"]).strip()
@@ -120,14 +133,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 state.selected_cafes = []
                 change_set.invalidated_fields.append("selected_cafes")
 
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
-
     # 2. Check duration / number_of_days change
     if "number_of_days" in updates and updates["number_of_days"] is not None:
         try:
@@ -152,11 +157,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                     )
                     if derived_rate and derived_rate != state.hotel_budget:
                         state.hotel_budget = derived_rate
-
-                # Changing duration invalidates the generated day-by-day timetable
-                if state.current_itinerary is not None:
-                    state.current_itinerary = None
-                    change_set.invalidated_fields.append("current_itinerary")
         except (ValueError, TypeError):
             pass
 
@@ -192,10 +192,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                     change_set.previous_values[date_field] = old_date
                     change_set.new_values[date_field] = parsed_date
                     setattr(state, date_field, parsed_date)
-
-                    if state.current_itinerary is not None and "current_itinerary" not in change_set.invalidated_fields:
-                        state.current_itinerary = None
-                        change_set.invalidated_fields.append("current_itinerary")
             except (ValueError, TypeError):
                 pass
 
@@ -230,6 +226,51 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             if derived_rate and derived_rate != state.hotel_budget:
                 state.hotel_budget = derived_rate
 
+    # 3C. Explicit accommodation changes (Milestone 3, M3.2 Fix #1)
+    if "accommodation_required" in updates and updates["accommodation_required"] is not None:
+        new_ar = bool(updates["accommodation_required"])
+        if new_ar != state.accommodation_required:
+            change_set.changed_fields.append("accommodation_required")
+            change_set.previous_values["accommodation_required"] = state.accommodation_required
+            change_set.new_values["accommodation_required"] = new_ar
+            state.accommodation_required = new_ar
+
+    if "accommodation_booked" in updates and updates["accommodation_booked"] is not None:
+        new_ab = bool(updates["accommodation_booked"])
+        if new_ab != state.accommodation_booked:
+            change_set.changed_fields.append("accommodation_booked")
+            change_set.previous_values["accommodation_booked"] = state.accommodation_booked
+            change_set.new_values["accommodation_booked"] = new_ab
+            state.accommodation_booked = new_ab
+
+    if "hotel_search_required" in updates and updates["hotel_search_required"] is not None:
+        new_hsr = bool(updates["hotel_search_required"])
+        if new_hsr != state.hotel_search_required:
+            change_set.changed_fields.append("hotel_search_required")
+            change_set.previous_values["hotel_search_required"] = state.hotel_search_required
+            change_set.new_values["hotel_search_required"] = new_hsr
+            state.hotel_search_required = new_hsr
+
+    if "hotel_required" in updates and updates["hotel_required"] is not None:
+        new_hr = bool(updates["hotel_required"])
+        if new_hr != state.hotel_required:
+            change_set.changed_fields.append("hotel_required")
+            change_set.previous_values["hotel_required"] = state.hotel_required
+            change_set.new_values["hotel_required"] = new_hr
+            state.hotel_required = new_hr
+
+    # 3D. Tracking of explicit fields and slot confidence (Milestone 3, M3.2)
+    if "explicit_fields" in updates and updates["explicit_fields"]:
+        for ef in updates["explicit_fields"]:
+            if ef not in state.explicit_fields:
+                state.explicit_fields.append(ef)
+
+    if "extracted_confidence" in updates and updates["extracted_confidence"]:
+        state.extracted_confidence.update(updates["extracted_confidence"])
+
+    # 3E. Deterministic derivation of dependent fields (nights, hotel_required)
+    derive_trip_inferences(state, state.explicit_fields)
+
     # 4A. Check hotel_total_budget change (total accommodation budget across all nights)
     if "hotel_total_budget" in updates and updates["hotel_total_budget"] is not None:
         try:
@@ -260,6 +301,13 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                             change_set.previous_values["hotel_budget"] = state.hotel_budget
                             change_set.new_values["hotel_budget"] = derived_rate
                         state.hotel_budget = derived_rate
+
+                        # Invalidate selected hotel if its rate exceeds new derived ceiling
+                        if state.hotel_selection is not None:
+                            hotel_rate = state.hotel_selection.price_per_night
+                            if hotel_rate is not None and hotel_rate > derived_rate:
+                                state.hotel_selection = None
+                                change_set.invalidated_fields.append("selected_hotel")
         except (ValueError, TypeError):
             pass
 
@@ -280,12 +328,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                     if hotel_rate is not None and hotel_rate > new_budget:
                         state.hotel_selection = None
                         change_set.invalidated_fields.append("selected_hotel")
-                        if state.current_route is not None and "current_route" not in change_set.invalidated_fields:
-                            state.current_route = None
-                            change_set.invalidated_fields.append("current_route")
-                        if state.current_itinerary is not None and "current_itinerary" not in change_set.invalidated_fields:
-                            state.current_itinerary = None
-                            change_set.invalidated_fields.append("current_itinerary")
         except (ValueError, TypeError):
             pass
 
@@ -317,14 +359,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             state.hotel_selection = raw_hotel
         change_set.changed_fields.append("hotel_selection")
         change_set.new_values["hotel_selection"] = state.hotel_selection.name if state.hotel_selection else str(raw_hotel)
-
-        # Invalidate route and itinerary anchored to previous hotel
-        if state.current_route is not None and "current_route" not in change_set.invalidated_fields:
-            state.current_route = None
-            change_set.invalidated_fields.append("current_route")
-        if state.current_itinerary is not None and "current_itinerary" not in change_set.invalidated_fields:
-            state.current_itinerary = None
-            change_set.invalidated_fields.append("current_itinerary")
 
         # Stage transition: Selecting a hotel transitions workflow to PLACE_DISCOVERY
         if state.planning_stage in (PlanningStage.DISCOVERY, PlanningStage.HOTEL_SELECTION):
@@ -362,12 +396,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("selected_places")
             change_set.new_values["selected_places"] = [p.name for p in state.selected_places]
             state.planning_stage = PlanningStage.PLACE_SELECTION
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4E-rem. Check remove_places change
     if "remove_places" in updates and updates["remove_places"] is not None:
@@ -375,8 +403,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         if not isinstance(raw_rem_places, list):
             raw_rem_places = [raw_rem_places]
         prev_places = [p.name for p in state.selected_places]
-        had_route = state.current_route is not None
-        had_itinerary = state.current_itinerary is not None
         removed_any = False
         for p_ident in raw_rem_places:
             ident_str = str(p_ident.get("name") if isinstance(p_ident, dict) else p_ident).strip()
@@ -388,10 +414,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 change_set.changed_fields.append("selected_places")
                 change_set.previous_values["selected_places"] = prev_places
                 change_set.new_values["selected_places"] = [p.name for p in state.selected_places]
-            if had_route and "current_route" not in change_set.invalidated_fields:
-                change_set.invalidated_fields.append("current_route")
-            if had_itinerary and "current_itinerary" not in change_set.invalidated_fields:
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4F. Check rejected_places change
     if "rejected_places" in updates and updates["rejected_places"] is not None:
@@ -408,12 +430,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("rejected_places")
             change_set.new_values["rejected_places"] = list(state.rejected_places)
             state.planning_stage = PlanningStage.PLACE_SELECTION
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4G. Explicit planning_stage update
     if "planning_stage" in updates and updates["planning_stage"] is not None:
@@ -461,12 +477,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("selected_restaurants")
             change_set.new_values["selected_restaurants"] = [r.name for r in state.selected_restaurants]
             state.planning_stage = PlanningStage.FOOD_SELECTION
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4H-rem. Check remove_restaurants change
     if "remove_restaurants" in updates and updates["remove_restaurants"] is not None:
@@ -474,8 +484,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         if not isinstance(raw_rem_rests, list):
             raw_rem_rests = [raw_rem_rests]
         prev_rests = [r.name for r in state.selected_restaurants]
-        had_route = state.current_route is not None
-        had_itinerary = state.current_itinerary is not None
         removed_any = False
         for r_ident in raw_rem_rests:
             ident_str = str(r_ident.get("name") if isinstance(r_ident, dict) else r_ident).strip()
@@ -487,10 +495,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 change_set.changed_fields.append("selected_restaurants")
                 change_set.previous_values["selected_restaurants"] = prev_rests
                 change_set.new_values["selected_restaurants"] = [r.name for r in state.selected_restaurants]
-            if had_route and "current_route" not in change_set.invalidated_fields:
-                change_set.invalidated_fields.append("current_route")
-            if had_itinerary and "current_itinerary" not in change_set.invalidated_fields:
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4I. Check selected_cafes change
     if "selected_cafes" in updates and updates["selected_cafes"] is not None:
@@ -525,12 +529,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("selected_cafes")
             change_set.new_values["selected_cafes"] = [c.name for c in state.selected_cafes]
             state.planning_stage = PlanningStage.FOOD_SELECTION
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4J. Check rejected_restaurants change
     if "rejected_restaurants" in updates and updates["rejected_restaurants"] is not None:
@@ -547,12 +545,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("rejected_restaurants")
             change_set.new_values["rejected_restaurants"] = list(state.rejected_restaurants)
             state.planning_stage = PlanningStage.FOOD_SELECTION
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4K. Check rejected_cafes change
     if "rejected_cafes" in updates and updates["rejected_cafes"] is not None:
@@ -569,12 +561,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.changed_fields.append("rejected_cafes")
             change_set.new_values["rejected_cafes"] = list(state.rejected_cafes)
             state.planning_stage = PlanningStage.FOOD_SELECTION
-            if state.current_route is not None:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4K-rem. Check remove_cafes change
     if "remove_cafes" in updates and updates["remove_cafes"] is not None:
@@ -582,8 +568,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         if not isinstance(raw_rem_cafes, list):
             raw_rem_cafes = [raw_rem_cafes]
         prev_cafes = [c.name for c in state.selected_cafes]
-        had_route = state.current_route is not None
-        had_itinerary = state.current_itinerary is not None
         removed_any = False
         for c_ident in raw_rem_cafes:
             ident_str = str(c_ident.get("name") if isinstance(c_ident, dict) else c_ident).strip()
@@ -595,10 +579,6 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 change_set.changed_fields.append("selected_cafes")
                 change_set.previous_values["selected_cafes"] = prev_cafes
                 change_set.new_values["selected_cafes"] = [c.name for c in state.selected_cafes]
-            if had_route and "current_route" not in change_set.invalidated_fields:
-                change_set.invalidated_fields.append("current_route")
-            if had_itinerary and "current_itinerary" not in change_set.invalidated_fields:
-                change_set.invalidated_fields.append("current_itinerary")
 
     # 4L. Check cuisine_preferences change
     if "cuisine_preferences" in updates and updates["cuisine_preferences"] is not None:
@@ -629,19 +609,15 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
             change_set.new_values["travel_mode"] = new_mode
             state.travel_mode = new_mode
 
-            # Changing travel mode invalidates travel timings and route legs
-            if state.current_route is not None and "current_route" not in change_set.invalidated_fields:
-                state.current_route = None
-                change_set.invalidated_fields.append("current_route")
-            if state.current_itinerary is not None and "current_itinerary" not in change_set.invalidated_fields:
-                state.current_itinerary = None
-                change_set.invalidated_fields.append("current_itinerary")
-
     # 6. Check interests change
     if "interests" in updates and updates["interests"] is not None:
         raw_interests = updates["interests"]
         if isinstance(raw_interests, list):
-            clean_interests = [str(i).strip() for i in raw_interests if str(i).strip()]
+            clean_interests = []
+            for i in raw_interests:
+                s = str(i).strip()
+                if s and s not in clean_interests:
+                    clean_interests.append(s)
             if clean_interests != state.interests:
                 change_set.changed_fields.append("interests")
                 change_set.previous_values["interests"] = list(state.interests)
@@ -652,7 +628,11 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
     if "dietary_preferences" in updates and updates["dietary_preferences"] is not None:
         raw_diet = updates["dietary_preferences"]
         if isinstance(raw_diet, list):
-            clean_diet = [str(d).strip() for d in raw_diet if str(d).strip()]
+            clean_diet = []
+            for d in raw_diet:
+                s = str(d).strip()
+                if s and s not in clean_diet:
+                    clean_diet.append(s)
             if clean_diet != state.dietary_preferences:
                 change_set.changed_fields.append("dietary_preferences")
                 change_set.previous_values["dietary_preferences"] = list(state.dietary_preferences)
@@ -777,6 +757,79 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                     }
                     change_set.new_values["meal_preferences"] = dict(state.meal_preferences)
 
+    # 8C. Check mark_required_stops and mark_stop_priority (Milestone 3, Batch 3)
+    if "mark_required_stops" in updates and updates["mark_required_stops"] is not None:
+        raw_req = updates["mark_required_stops"]
+        if not isinstance(raw_req, list):
+            raw_req = [raw_req]
+        prev_req = list(state.required_stops)
+        changed_any = False
+        for s in raw_req:
+            s_name = str(s).strip()
+            if s_name and state.mark_stop_required(s_name):
+                changed_any = True
+        if changed_any or (set(state.required_stops) != set(prev_req)):
+            if "required_stops" not in change_set.changed_fields:
+                change_set.changed_fields.append("required_stops")
+                change_set.previous_values["required_stops"] = prev_req
+                change_set.new_values["required_stops"] = list(state.required_stops)
+
+    if "mark_stop_priority" in updates and updates["mark_stop_priority"] is not None:
+        raw_prio = updates["mark_stop_priority"]
+        if not isinstance(raw_prio, list):
+            raw_prio = [raw_prio]
+        prev_req = list(state.required_stops)
+        changed_any = False
+        for p in raw_prio:
+            if isinstance(p, dict) and "name" in p and "priority" in p:
+                if state.mark_stop_priority(str(p["name"]).strip(), str(p["priority"]).strip()):
+                    changed_any = True
+        if changed_any:
+            if "required_stops" not in change_set.changed_fields:
+                change_set.changed_fields.append("required_stops")
+                change_set.previous_values["required_stops"] = prev_req
+                change_set.new_values["required_stops"] = list(state.required_stops)
+
+    # 8D. Check constraints list
+    if "constraints" in updates and updates["constraints"] is not None:
+        raw_constraints = updates["constraints"]
+        if not isinstance(raw_constraints, list):
+            raw_constraints = [raw_constraints]
+        from app.schemas.constraint import Constraint
+        prev_count = len(state.constraints)
+        for c in raw_constraints:
+            if isinstance(c, Constraint):
+                state.add_constraint(c)
+            elif isinstance(c, dict):
+                try:
+                    state.add_constraint(Constraint(**c))
+                except Exception:
+                    pass
+        if len(state.constraints) != prev_count:
+            change_set.changed_fields.append("constraints")
+            change_set.previous_values["constraints"] = prev_count
+            change_set.new_values["constraints"] = len(state.constraints)
+
+    # 9. Deterministic Dependency Invalidation Phase (Component 3 & 4)
+    # The set of triggers includes both explicitly changed fields and invalidated source selections
+    triggers = set(change_set.changed_fields) | set(change_set.invalidated_fields)
+    invalidated_resources = get_invalidated_resources(triggers)
+
+    # Component 4: Apply freshness transitions (VALID -> STALE, NOT_AVAILABLE stays NOT_AVAILABLE)
+    FreshnessRegistry.apply_invalidation(state.derived_freshness, invalidated_resources)
+
+    if DerivedResource.CURRENT_ROUTE in invalidated_resources:
+        if had_route or state.current_route is not None:
+            state.current_route = None
+            if "current_route" not in change_set.invalidated_fields:
+                change_set.invalidated_fields.append("current_route")
+
+    if DerivedResource.CURRENT_ITINERARY in invalidated_resources:
+        if had_itinerary or state.current_itinerary is not None:
+            state.current_itinerary = None
+            if "current_itinerary" not in change_set.invalidated_fields:
+                change_set.invalidated_fields.append("current_itinerary")
+
     # Increment state_version if any changes occurred
     if change_set.has_changes():
         state.state_version += 1
@@ -872,22 +925,30 @@ def get_next_active_question(state: TripState) -> Optional[ActiveQuestion]:
             reason="required_for_itinerary",
         )
 
-    if (not state.hotel_budget or state.hotel_budget <= 0) and (not state.hotel_total_budget or state.hotel_total_budget <= 0):
-        return ActiveQuestion(
-            field="hotel_total_budget",
-            expected_type="money",
-            scope="accommodation",
-            prompt_text="What budget would you like to keep for accommodation?",
-            reason="required_for_hotel_search",
-        )
+    # 4. Check accommodation budget only if hotel search is required (Milestone 3, M3.2 Fix #1)
+    hotel_needed = state.hotel_search_required
+    if hotel_needed is None:
+        hotel_needed = state.hotel_required is True or (state.hotel_required is None and (state.number_of_nights or 0) > 0)
+        if state.hotel_required is False or (state.number_of_nights is not None and state.number_of_nights == 0):
+            hotel_needed = False
 
-    if not state.trip_start_date:
-        return ActiveQuestion(
-            field="trip_start_date",
-            expected_type="date",
-            scope="trip",
-            prompt_text="When are you planning to start your trip?",
-            reason="required_for_exact_dates",
-        )
+    if hotel_needed:
+        if (not state.hotel_budget or state.hotel_budget <= 0) and (not state.hotel_total_budget or state.hotel_total_budget <= 0):
+            return ActiveQuestion(
+                field="hotel_total_budget",
+                expected_type="money",
+                scope="accommodation",
+                prompt_text="What budget would you like to keep for accommodation?",
+                reason="required_for_hotel_search",
+            )
+
+        if not state.trip_start_date:
+            return ActiveQuestion(
+                field="trip_start_date",
+                expected_type="date",
+                scope="trip",
+                prompt_text="When are you planning to start your trip?",
+                reason="required_for_exact_dates",
+            )
 
     return None
