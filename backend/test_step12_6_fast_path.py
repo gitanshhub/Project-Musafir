@@ -6,10 +6,8 @@ Semantics Engine, and Conservative Fast-Path Resolver.
 import unittest
 from datetime import date
 
-from app.agent.state import TripState, get_state, get_or_create_state, clear_all_states
+from app.agent.state import TripState, get_state
 from app.agent.context import (
-    ActiveQuestion,
-    VisibleItemReference,
     ConversationContext,
     SessionState,
     get_session,
@@ -23,10 +21,7 @@ from app.agent.semantics import (
     calculate_nights,
     calculate_nightly_hotel_budget,
     parse_currency_amount,
-    parse_duration_days,
-    parse_duration_nights,
     resolve_relative_date,
-    get_current_date,
 )
 from app.agent.fast_path import resolve_fast_path, FastPathResult
 
@@ -379,11 +374,14 @@ class TestStep12_6FastPathResolver(unittest.TestCase):
         self.assertEqual(res_7d.state_updates["number_of_nights"], 6)
         session.conversation_context.clear_active_question()
 
-        # 3. Destination pivot: "kashmir instead", "nah switch to kerala" -> MUST fallback to LLM
-        for pivot_text in ["kashmir instead", "nah switch to kerala", "forget jaipur, let's do goa"]:
+        # Unambiguous destination corrections retain existing trip preferences.
+        for pivot_text, destination in [("kashmir instead", "Kashmir"), ("nah switch to kerala", "Kerala")]:
             res_pivot = resolve_fast_path(pivot_text, session)
-            self.assertFalse(res_pivot.matched, f"Pivot '{pivot_text}' should fallback to LLM")
-            self.assertEqual(res_pivot.intent, "FALLBACK_TO_LLM")
+            self.assertTrue(res_pivot.matched)
+            self.assertEqual(res_pivot.state_updates["destination"], destination)
+        ambiguous_pivot = resolve_fast_path("forget jaipur, let's do goa", session)
+        self.assertFalse(ambiguous_pivot.matched)
+        self.assertEqual(ambiguous_pivot.intent, "FALLBACK_TO_LLM")
 
         # 4. Contrastive ordinal: "actually not the second one, the last hotel" -> MUST NOT wrongly pick hotel #2!
         session.conversation_context.set_visible_items("hotel", [
@@ -416,4 +414,3 @@ class TestStep12_6FastPathResolver(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

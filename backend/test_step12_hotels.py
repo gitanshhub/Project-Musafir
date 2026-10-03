@@ -7,6 +7,7 @@ import sys
 import os
 import json
 from uuid import uuid4
+from unittest.mock import patch
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from main import app
 from app.agent.loop import AgentLoop, AgentResult
+from app.agent.fast_path import FastPathResult
 from app.llm.openrouter_client import LLMResponse
 from app.agent.state import clear_all_states, get_or_create_state
 
@@ -73,7 +75,8 @@ def test_1_hotel_result_serialization():
     app.dependency_overrides[agent_api.get_agent_loop] = lambda: MockHotelAgentLoop()
 
     try:
-        res = client.post("/agent/chat", json={"message": "Find hotels in Jaipur under 5000"})
+        with patch("app.api.agent.resolve_fast_path", return_value=FastPathResult(matched=False)):
+            res = client.post("/agent/chat", json={"message": "Find hotels in Jaipur under 5000"})
         assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.text}"
         data = res.json()
 
@@ -239,7 +242,8 @@ def test_4_empty_hotel_results():
     app.dependency_overrides[agent_api.get_agent_loop] = lambda: MockEmptyHotelAgentLoop()
 
     try:
-        res = client.post("/agent/chat", json={"message": "Find hotels under 500"})
+        with patch("app.api.agent.resolve_fast_path", return_value=FastPathResult(matched=False)):
+            res = client.post("/agent/chat", json={"message": "Find hotels under 500"})
         assert res.status_code == 200
         data = res.json()
         assert data["results"] is not None

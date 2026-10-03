@@ -9,8 +9,10 @@ from typing import Any, Dict, Optional, Set
 
 from pydantic import BaseModel, Field
 
-from app.agent.extraction import ExtractedTripSlots, SlotConfidence
+from app.agent.extraction import ExtractedTripSlots, SlotConfidence, is_negated_match
 from app.agent.state import TripState
+from app.agent.context import SessionState
+from app.agent.turn import TurnSemantics, build_context_snapshot
 from app.llm.openrouter_client import LLMError, OpenRouterClient
 
 
@@ -36,6 +38,7 @@ class FallbackResult(BaseModel):
     trigger: Optional[FallbackTrigger] = None
     latency_ms: int = 0
     error: Optional[str] = None
+    semantics: TurnSemantics = Field(default_factory=TurnSemantics)
 
 
 def detect_fallback_trigger(
@@ -54,15 +57,17 @@ def detect_fallback_trigger(
         checks.append("ambiguous_accommodation_numbers")
         suspicious_fields.update({"accommodation_required", "accommodation_booked", "hotel_search_required", "hotel_budget"})
 
-    destinations = re.findall(r"\b(?:goa|kerala|jaipur|kochi|udaipur|mumbai|manali|agra)\b", text)
+    destinations = [m.group() for m in re.finditer(r"\b(?:goa|kerala|jaipur|kochi|udaipur|mumbai|manali|agra)\b", text) if not is_negated_match(m.span(), text)]
     if len(set(destinations)) > 1:
         checks.append("competing_destination_candidates")
         suspicious_fields.add("destination")
 
     has_trip_context = bool(re.search(
-        r"\b(?:trip|travel|tour|vacation|holiday|plan|planning|going|visit|stay|days?|nights?|weekend|itinerary)\b",
+        r"\b(?:trip|travel|tour|vacation|holiday|plan|planning|go|going|visit|stay|days?|nights?|weekend|itinerary|hotels?|attractions?|restaurants?|cafes?|jaana|din)\b",
         text,
     ))
+    if state.destination and re.search(r"\b(?:instead|switch to|change to|make it|actually|forget)\b", text):
+        has_trip_context = True
     if extracted.destination and not has_trip_context:
         checks.append("missing_trip_context")
         suspicious_fields.add("destination")
@@ -90,11 +95,13 @@ def _prompt(
     message: str,
     extracted: ExtractedTripSlots,
     trigger: FallbackTrigger,
+    session: Optional[SessionState] = None,
 ) -> str:
     known = extracted.high_confidence_updates()
     fields = ["destination", "number_of_days", "number_of_nights", "travel_mode",
               "accommodation_required", "accommodation_booked", "hotel_search_required",
-              "hotel_budget", "dietary_preferences", "interests"]
+              "hotel_budget", "hotel_total_budget", "trip_budget", "trip_start_date", "trip_end_date",
+              "dietary_preferences", "interests"]
     if trigger.category == FallbackCategory.INCOMPLETENESS:
         task = "Resolve only the missing or low-confidence fields. Do not guess; use null when unresolved."
     else:
@@ -105,11 +112,20 @@ def _prompt(
     return f"""You are a strict trip-slot extraction component.
 {task}
 User message: {message!r}
+Saved context (facts are memory, not new updates): {json.dumps(build_context_snapshot(session) if session else {}, default=str)}
 Deterministic high-confidence values (do not override unless clearly contradicted): {json.dumps(known, default=str)}
 Trigger: {trigger.category.value}; checks: {trigger.checks}
 Return JSON only with this shape:
-{{"process_as_trip": true, "slots": {{"field": value}}, "confidence": {{"field": "HIGH"|"LOW"}}}}
+{{"process_as_trip": true, "slots": {{"field": value}}, "confidence": {{"field": "HIGH"|"LOW"}},
+ "requested_actions": ["PLAN_TRIP"|"SEARCH_HOTELS"|"SEARCH_PLACES"|"SEARCH_FOOD"|"ROUTE_REQUEST"|"ITINERARY_REQUEST"],
+ "references": [{{"operation": "select"|"remove"|"keep", "entity_type": "hotel"|"place"|"restaurant"|"cafe", "reference": "user's name or ordinal"}}],
+ "duration_delta": null, "clarification": null}}
 Allowed fields: {fields}
+Interpret the entire message, including requested work and explicit corrections. Active questions are hints, not overrides.
+Only emit slots mentioned or changed this turn, not copies of saved facts. Resolve short answers using the active question.
+For relative duration edits return the signed duration_delta; never calculate a new total or dates.
+Preserve all explicit actions and references in order. Do not invent entities or select recommendations for the traveler.
+If any part is ambiguous, return one focused clarification rather than pretending it was fully handled.
 Use null or omit fields you cannot resolve. Never invent a city, duration, mode, budget, or hotel state."""
 
 
@@ -140,23 +156,28 @@ def run_fallback(
     extracted: ExtractedTripSlots,
     trigger: FallbackTrigger,
     client: OpenRouterClient,
+    session: Optional[SessionState] = None,
 ) -> FallbackResult:
     started = time.perf_counter()
     try:
         response = client.send_message(
             messages=[
                 {"role": "system", "content": "Return only valid JSON. Do not include markdown."},
-                {"role": "user", "content": _prompt(message, extracted, trigger)},
+                {"role": "user", "content": _prompt(message, extracted, trigger, session)},
             ],
             temperature=0.0,
         )
         slots, process_as_trip = _parse_response(response.content or "")
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (response.content or "").strip(), flags=re.IGNORECASE | re.DOTALL)
+        payload = json.loads(raw)
+        semantics = TurnSemantics(**{k: payload[k] for k in TurnSemantics.model_fields if k in payload})
         result = FallbackResult(
             succeeded=True,
             slots=slots,
             process_as_trip=process_as_trip,
             suspicious_fields=trigger.suspicious_fields,
             trigger=trigger,
+            semantics=semantics,
         )
     except (LLMError, ValueError, TypeError, json.JSONDecodeError) as exc:
         result = FallbackResult(
@@ -182,6 +203,11 @@ def merge_fallback_slots(
     override_fields: Set[str],
 ) -> ExtractedTripSlots:
     merged = deterministic.model_copy(deep=True)
+    for field in override_fields:
+        if field in merged.explicit_fields:
+            merged.explicit_fields.remove(field)
+        merged.confidence.pop(field, None)
+        setattr(merged, field, ExtractedTripSlots.model_fields[field].default)
     for field in fallback.explicit_fields:
         if field not in override_fields and field in deterministic.explicit_fields:
             continue

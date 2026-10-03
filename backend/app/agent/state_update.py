@@ -4,7 +4,7 @@ Calculates deterministic change sets, manages dependency invalidation,
 readiness evaluations, and stale-result state versioning.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from datetime import date as dt_date
 
@@ -197,7 +197,7 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
 
     # 3B. Deterministic synchronization of dates, checkout, duration, and nights
     if any(k in updates for k in ["number_of_days", "trip_start_date", "trip_end_date", "number_of_nights"]) or state.trip_start_date:
-        calc_end = None if ("number_of_days" in updates and "trip_end_date" not in updates) else state.trip_end_date
+        calc_end = None if ({"number_of_days", "trip_start_date"} & updates.keys() and "trip_end_date" not in updates) else state.trip_end_date
         derived = derive_trip_dates(
             start_date=state.trip_start_date,
             end_date=calc_end,
@@ -269,6 +269,9 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         state.extracted_confidence.update(updates["extracted_confidence"])
 
     # 3E. Deterministic derivation of dependent fields (nights, hotel_required)
+    if {"number_of_days", "number_of_nights", "trip_start_date", "trip_end_date"} & updates.keys():
+        if "accommodation_required" not in state.explicit_fields and "hotel_required" not in state.explicit_fields:
+            state.accommodation_required = None
     derive_trip_inferences(state, state.explicit_fields)
 
     # 4A. Check hotel_total_budget change (total accommodation budget across all nights)

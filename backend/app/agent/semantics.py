@@ -352,7 +352,7 @@ def resolve_relative_date(
     }
 
     # "24 september" or "24th sep" or "24 sept"
-    m_day1 = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)\b", clean)
+    m_day1 = next((m for m in re.finditer(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)\b", clean) if m.group(2) in month_map), None)
     if m_day1 and m_day1.group(2) in month_map:
         d_val = int(m_day1.group(1))
         m_val = month_map[m_day1.group(2)]
@@ -367,7 +367,7 @@ def resolve_relative_date(
             pass
 
     # "sep 24" or "october 15" or "september 24th"
-    m_day2 = re.search(r"\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b", clean)
+    m_day2 = next((m for m in re.finditer(r"\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b", clean) if m.group(1) in month_map), None)
     if m_day2 and m_day2.group(1) in month_map:
         m_val = month_map[m_day2.group(1)]
         d_val = int(m_day2.group(2))
@@ -563,5 +563,4 @@ def derive_trip_inferences(
         derived["hotel_required"] = hotel_search_req
 
     return derived
-
 

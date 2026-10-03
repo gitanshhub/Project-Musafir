@@ -7,28 +7,27 @@ Falls back conservatively to LLM whenever ambiguity exists.
 
 import re
 from datetime import timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
-from app.agent.context import SessionState, ActiveQuestion, VisibleItemReference
+from app.agent.context import SessionState, VisibleItemReference
 from app.agent.state import PlanningStage
 from app.agent.semantics import (
     parse_currency_amount,
     parse_duration_days,
-    parse_duration_nights,
     resolve_relative_date,
     parse_date_range,
     calculate_nights,
     calculate_nightly_hotel_budget,
 )
-from app.agent.extraction import extract_trip_slots, ExtractedTripSlots
+from app.agent.extraction import extract_trip_slots
+from app.agent.turn import InterpretedTurn, interpret_complete_turn
 from app.agent.llm_extraction import detect_fallback_trigger, merge_fallback_slots, run_fallback
 from app.llm.openrouter_client import OpenRouterClient
 from app.agent.resolution import (
     resolve_entity_reference,
     resolve_budget_phrase,
     build_entity_replacement_batch,
-    ClarificationRequest,
     BudgetScope,
 )
 
@@ -47,6 +46,7 @@ class FastPathResult(BaseModel):
     fallback_trigger: Optional[str] = None
     fallback_succeeded: Optional[bool] = None
     process_as_trip: Optional[bool] = None
+    turn: Optional[InterpretedTurn] = None
 
 
 # Conservative regex patterns for pure informational travel questions (non-planning)
@@ -60,6 +60,76 @@ GENERAL_QUERY_PATTERNS = [
 
 
 def resolve_fast_path(
+    user_message: str,
+    session: SessionState,
+    llm_client: Optional[OpenRouterClient] = None,
+) -> FastPathResult:
+    if re.search(r"\b(?:more relaxed|slower pace|less crowded|same budget|best places)\b", user_message.lower()):
+        return FastPathResult(matched=False, explanation="The complete request requires semantic interpretation.")
+    entity_command = re.match(r"^(?:remove|drop|replace|change|switch|mark|must visit|keep|pick|select)\b", user_message.lower())
+    compound_change = re.search(r"[,;]|\b(?:days?|walking|driving|cycling|transit|budget)\b", user_message.lower())
+    if entity_command and not compound_change:
+        result = _resolve_single_intent(user_message, session, None)
+        if result.matched:
+            return result
+    turn = interpret_complete_turn(user_message, session)
+    if turn:
+        extracted = extract_trip_slots(user_message, session.trip_state)
+        trigger = detect_fallback_trigger(user_message, extracted, session.trip_state)
+        fallback = None
+        short_destination = bool(extracted.destination and re.fullmatch(r"(?:to\s+|in\s+|actually\s+|actually\s+make\s+it\s+|make\s+it\s+|switch\s+to\s+|change\s+to\s+)?" + re.escape(extracted.destination.lower()) + r"(?:\s+instead)?", user_message.strip().lower()))
+        destination_answer = session.conversation_context.active_question and session.conversation_context.active_question.field == "destination"
+        implicit_duration = bool(trigger and extracted.number_of_days is None and re.search(r"\b(?:short getaway|free (?:sunday|saturday)|couple|several|longer|shorter)\b", user_message.lower()))
+        if trigger and (trigger.suspicious_fields or implicit_duration) and not (trigger.checks == ["missing_trip_context"] and (short_destination or destination_answer)):
+            if llm_client:
+                fallback = run_fallback(user_message, extracted, trigger, llm_client, session=session)
+            if fallback and fallback.succeeded:
+                if fallback.process_as_trip is False:
+                    return FastPathResult(matched=True, intent="NON_TRIP_QUERY", process_as_trip=False)
+                merged = merge_fallback_slots(extracted, fallback.slots, trigger.suspicious_fields)
+                turn.updates = merged.high_confidence_updates()
+                turn.updates["explicit_fields"] = list(turn.updates)
+                for field in type(fallback.semantics).model_fields:
+                    value = getattr(fallback.semantics, field)
+                    if value:
+                        setattr(turn, field, value)
+            else:
+                turn.clarification = "How many days should the trip be?" if implicit_duration else "Could you clarify the destination or accommodation change you want?"
+        intent = "PLAN_TRIP" if ("destination" in turn.updates or "number_of_days" in turn.updates) else "UPDATE_FIELD"
+        if session.trip_state.number_of_days and "number_of_days" in turn.updates and "destination" not in turn.updates:
+            intent = "UPDATE_DURATION"
+        if not (set(turn.updates) - {"explicit_fields", "extracted_confidence"}) and turn.requested_actions:
+            intent = turn.requested_actions[0]
+        if "number_of_days" in turn.updates and "number_of_nights" not in turn.updates:
+            turn.updates["number_of_nights"] = max(0, turn.updates["number_of_days"] - 1)
+        if "hotel_total_budget" in turn.updates:
+            nights = turn.updates.get("number_of_nights", session.trip_state.number_of_nights)
+            if nights:
+                turn.updates["hotel_budget"] = round(turn.updates["hotel_total_budget"] / nights, 2)
+        updates = dict(turn.updates)
+        if turn.duration_delta is not None and session.trip_state.number_of_days:
+            intent = "UPDATE_DURATION"
+            updates["number_of_days"] = session.trip_state.number_of_days + turn.duration_delta
+        reference = None
+        if intent == "SEARCH_FOOD":
+            reference = {"category": turn.food_category or "restaurant", "meal_type": turn.meal_type, "anchor": turn.location_anchor}
+        active = session.conversation_context.active_question
+        return FastPathResult(matched=True, confidence="high", intent=intent, state_updates=updates,
+                              reference_resolution=reference,
+                              cleared_active_question=bool(active and active.field in turn.updates),
+                              turn=turn, fallback_trigger=trigger.category.value if fallback else None,
+                              fallback_succeeded=fallback.succeeded if fallback else None)
+    result = _resolve_single_intent(user_message, session, None)
+    if not result.matched and llm_client is not None:
+        result = _resolve_single_intent(user_message, session, llm_client)
+    if result.matched and result.intent in {"PLAN_TRIP", "ANSWER_ACTIVE_QUESTION", "UPDATE_FIELD", "UPDATE_BUDGET"}:
+        actions = ["PLAN_TRIP"] if "destination" in result.state_updates and not session.trip_state.destination else []
+        if result.turn is None:
+            result.turn = InterpretedTurn(updates=result.state_updates, requested_actions=actions)
+    return result
+
+
+def _resolve_single_intent(
     user_message: str,
     session: SessionState,
     llm_client: Optional[OpenRouterClient] = None,
@@ -687,7 +757,7 @@ def resolve_fast_path(
         fallback_trigger = detect_fallback_trigger(clean, extracted, trip)
         fallback_result = None
         if fallback_trigger and llm_client is not None:
-            fallback_result = run_fallback(clean, extracted, fallback_trigger, llm_client)
+            fallback_result = run_fallback(clean, extracted, fallback_trigger, llm_client, session=session)
             if fallback_result.succeeded and fallback_result.slots:
                 extracted = merge_fallback_slots(
                     extracted,
@@ -704,6 +774,11 @@ def resolve_fast_path(
                         process_as_trip=False,
                         explanation="Fallback classified the message as outside trip planning.",
                     )
+                if fallback_result.semantics.model_dump(exclude_defaults=True):
+                    turn = InterpretedTurn(updates=extracted.high_confidence_updates(), **fallback_result.semantics.model_dump())
+                    turn.updates["explicit_fields"] = list(turn.updates)
+                    return FastPathResult(matched=True, confidence="high", intent="UPDATE_FIELD", state_updates=turn.updates,
+                                          turn=turn, fallback_trigger=fallback_trigger.category.value, fallback_succeeded=True)
         high_updates = extracted.high_confidence_updates()
 
         # Check for destination corrections e.g. "Actually make it Pune, not Goa" or "Actually make it Jaipur"
@@ -719,6 +794,7 @@ def resolve_fast_path(
             or ("dietary_preferences" in high_updates and not trip.dietary_preferences)
             or (is_multi_slot and (not trip.destination or len(trip.messages) == 0 or is_correction))
             or (is_multi_slot and high_updates)
+            or (fallback_result and fallback_result.succeeded and high_updates)
         )
 
         if is_slot_update and high_updates:
@@ -745,6 +821,7 @@ def resolve_fast_path(
                 explanation=f"Slot extraction resolved: {', '.join(explanation_parts)}",
                 fallback_trigger=(fallback_trigger.category.value if fallback_trigger else None),
                 fallback_succeeded=(fallback_result.succeeded if fallback_result else None),
+                turn=InterpretedTurn(updates=high_updates, **fallback_result.semantics.model_dump()) if fallback_result and fallback_result.succeeded else None,
             )
 
     # -------------------------------------------------------------------------
