@@ -166,9 +166,15 @@ class FeasibilityEngine:
         if hotel_price is None or hotel_price <= 0:
             return
 
-        # Nightly rate ceiling check
-        if state.hotel_budget and hotel_price > state.hotel_budget:
-            excess = hotel_price - state.hotel_budget
+        budget = state.effective_hotel_budget
+        if budget and hotel_price > budget:
+            excess = hotel_price - budget
+            total_budget_note = (
+                f" (₹{state.hotel_total_budget:,.0f} total over {state.number_of_nights} nights)"
+                if state.hotel_total_budget and state.number_of_nights
+                and (not state.hotel_budget or budget < state.hotel_budget)
+                else ""
+            )
             violations.append(
                 ConstraintViolation(
                     violation_type=ConstraintViolationType.BUDGET_CONFLICT,
@@ -177,20 +183,20 @@ class FeasibilityEngine:
                         scope=ConstraintScope.HOTEL,
                         priority=ConstraintPriority.REQUIRED,
                         source=ConstraintSource.USER_EXPLICIT,
-                        value=state.hotel_budget,
+                        value=budget,
                         status=ConstraintStatus.VIOLATED,
                     ),
                     affected_items=[hotel.name],
                     actual_value=hotel_price,
-                    required_value=state.hotel_budget,
+                    required_value=budget,
                     excess_or_deficit=excess,
                     severity="CRITICAL",
                     explanation=(
                         f"Selected hotel '{hotel.name}' costs ₹{hotel_price:,.0f}/night, "
-                        f"which exceeds your nightly budget ceiling of ₹{state.hotel_budget:,.0f} "
+                        f"which exceeds your effective nightly budget ceiling of ₹{budget:,.0f}{total_budget_note} "
                         f"(over by ₹{excess:,.0f}/night)."
                     ),
-                    metadata={"hotel_name": hotel.name, "price_per_night": hotel_price, "budget": state.hotel_budget},
+                    metadata={"hotel_name": hotel.name, "price_per_night": hotel_price, "budget": budget, "hotel_total_budget": state.hotel_total_budget},
                 )
             )
 
@@ -519,7 +525,7 @@ def format_feasibility_explanation(result: FeasibilityResult, state: TripState) 
         if result.unscheduled_items:
             options.append(f"3. Remove one or more optional stops (e.g. \"remove {result.unscheduled_items[0]}\")")
     elif any(v.violation_type == ConstraintViolationType.BUDGET_CONFLICT for v in result.violations):
-        options.append("1. Increase your nightly hotel budget ceiling (e.g. \"increase hotel budget to ...\")")
+        options.append("1. Increase the applicable nightly or total hotel budget ceiling (e.g. \"increase hotel budget to ...\")")
         options.append("2. Switch to an accommodation under your budget (e.g. \"change hotel to ...\")")
     elif any(v.violation_type == ConstraintViolationType.MODE_CONFLICT for v in result.violations):
         options.append("1. Switch travel mode to driving or transit (e.g. \"switch to driving\")")

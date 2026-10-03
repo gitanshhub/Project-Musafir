@@ -133,6 +133,12 @@ def search_hotels_tool(
         if check_out_dt <= check_in_dt:
             return {"success": False, "error": "check_out must be after check_in"}
 
+        if trip_state:
+            ceilings = [v for v in (max_price, trip_state.hotel_budget) if v is not None]
+            if trip_state.hotel_total_budget:
+                ceilings.append(trip_state.hotel_total_budget / (check_out_dt - check_in_dt).days)
+            max_price = min(ceilings) if ceilings else None
+
         params = build_hotel_search_params(
             destination=destination.strip(),
             check_in=check_in_dt,

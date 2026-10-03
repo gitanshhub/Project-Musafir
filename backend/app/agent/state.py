@@ -464,6 +464,13 @@ class TripState(BaseModel):
         self.selected_cafes = []
         self.invalidate_itinerary()
 
+    @property
+    def effective_hotel_budget(self) -> Optional[float]:
+        ceilings = [self.hotel_budget] if self.hotel_budget else []
+        if self.hotel_total_budget and self.number_of_nights:
+            ceilings.append(self.hotel_total_budget / self.number_of_nights)
+        return min(ceilings) if ceilings else None
+
     def is_ready_for_routing(self) -> bool:
         """
         Checks if the trip has sufficient data to generate an optimized route:

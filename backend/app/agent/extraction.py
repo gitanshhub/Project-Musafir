@@ -502,7 +502,7 @@ def extract_budget_slots(message: str) -> Dict[str, float]:
     """Scope monetary spans locally, without consuming dates or trip durations."""
     updates: Dict[str, float] = {}
     amount_pattern = r"(?:[₹$]\s*\d[\d,]*(?:\.\d+)?(?:\s*(?:k|lakh|lac|l))?\b|\b\d[\d,]*(?:\.\d+)?\s*(?:k|lakh|lac|l|rs|inr|rupees)\b|\b(?:rs\.?|inr)\s*\d[\d,]*(?:\.\d+)?\b)"
-    for clause in re.split(r"[;\n]|(?<!\d)\.(?!\d)|\band\b", message.lower()):
+    for clause in re.split(r"[;\n]|,(?!\d)|(?<!\d)\.(?!\d)|\band\b", message.lower()):
         matches = list(re.finditer(amount_pattern, clause))
         if not matches and re.search(r"\b(?:budget|per night|nightly)\b|/night", clause):
             matches = list(re.finditer(r"\b\d[\d,]*(?:\.\d+)?\b", clause))

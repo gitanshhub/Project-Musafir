@@ -38,6 +38,7 @@ class TurnSemantics(BaseModel):
 class InterpretedTurn(TurnSemantics):
     updates: Dict[str, Any] = Field(default_factory=dict)
     unresolved_reference_index: Optional[int] = None
+    cancelled: bool = False
 
 
 def build_context_snapshot(session: SessionState) -> Dict[str, Any]:
@@ -140,15 +141,23 @@ def extract_actions(message: str) -> List[ActionName]:
 
 
 def interpret_complete_turn(
-    message: str, session: SessionState
+    message: str, session: SessionState, *, slot_message: Optional[str] = None
 ) -> Optional[InterpretedTurn]:
     """Resolve explicit multi-part turns before any single-intent early return."""
     text = message.lower().strip()
     pending = session.conversation_context.pending_turn
-    if pending and text in ("no", "cancel", "nevermind", "forget it"):
+    cancel_requested = text in ("cancel", "nevermind", "forget it") and (
+        pending
+        or session.conversation_context.pending_actions
+        or session.conversation_context.active_question
+    )
+    rejected_pending_turn = text == "no" and (
+        pending or session.conversation_context.pending_actions
+    )
+    if cancel_requested or rejected_pending_turn:
         session.conversation_context.pending_turn = None
         session.conversation_context.clear_active_question()
-        return InterpretedTurn()
+        return InterpretedTurn(cancelled=True)
     if pending and len(text.split()) <= 5:
         turn = InterpretedTurn(**pending)
         active = session.conversation_context.active_question
@@ -190,7 +199,11 @@ def interpret_complete_turn(
             turn.clarification = None
             return turn
         total_days = int(text) if text.isdigit() else parse_duration_days(text)
-        if turn.duration_delta is not None and total_days:
+        active = session.conversation_context.active_question
+        if total_days and (
+            turn.duration_delta is not None
+            or (active and active.field == "number_of_days")
+        ):
             turn.duration_delta = None
             turn.clarification = None
             turn.updates["number_of_days"] = total_days
@@ -206,7 +219,9 @@ def interpret_complete_turn(
         return None
     if re.search(r"\b(?:more relaxed|slower pace|less crowded|same budget)\b", text):
         return None
-    slots = extract_trip_slots(message, session.trip_state)
+    slots = extract_trip_slots(
+        slot_message if slot_message is not None else message, session.trip_state
+    )
     updates = slots.high_confidence_updates()
     date_range = parse_date_range(message)
     if date_range:
