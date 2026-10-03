@@ -64,9 +64,17 @@ class OpenRouterClient:
     Decoupled from vendor-specific SDKs to allow seamless model/provider switching.
     """
 
-    def __init__(self, config: Optional[LLMConfig] = None):
+    def __init__(self, config: Optional[LLMConfig] = None, lazy: bool = False):
+        self._config = config
+        if not lazy:
+            self.config
+
+    @property
+    def config(self) -> LLMConfig:
         try:
-            self.config = config or get_llm_config()
+            if self._config is None:
+                self._config = get_llm_config()
+            return self._config
         except ValueError as exc:
             raise LLMConfigError(str(exc)) from exc
 
@@ -123,6 +131,8 @@ class OpenRouterClient:
             # If not 429, exit retry loop
             break
 
+        if response is None:
+            raise LLMProviderError("OpenRouter did not return a response.")
         # Handle HTTP status codes
         if response.status_code == 401:
             raise LLMAuthError("OpenRouter authentication failed: Invalid or expired API key.")

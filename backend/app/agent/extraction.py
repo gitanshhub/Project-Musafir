@@ -9,14 +9,12 @@ readiness are handled downstream by plain deterministic code.
 import re
 from datetime import date as dt_date
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 from app.agent.state import TripState
 from app.agent.semantics import (
     parse_currency_amount,
-    parse_duration_days,
-    parse_duration_nights,
     parse_date_range,
     resolve_relative_date,
 )
@@ -32,15 +30,16 @@ class ExtractedTripSlots(BaseModel):
     Structured outcome of multi-slot extraction from a user message.
     """
     destination: Optional[str] = None
-    number_of_days: Optional[int] = None
-    number_of_nights: Optional[int] = None
-    travel_mode: Optional[str] = None
+    number_of_days: Optional[int] = Field(None, ge=1)
+    number_of_nights: Optional[int] = Field(None, ge=0)
+    travel_mode: Optional[Literal["driving", "walking", "transit", "bicycling", "two_wheeler"]] = None
     hotel_required: Optional[bool] = None
     accommodation_required: Optional[bool] = None
     accommodation_booked: Optional[bool] = None
     hotel_search_required: Optional[bool] = None
-    hotel_budget: Optional[float] = None
-    hotel_total_budget: Optional[float] = None
+    hotel_budget: Optional[float] = Field(None, gt=0)
+    hotel_total_budget: Optional[float] = Field(None, gt=0)
+    trip_budget: Optional[float] = Field(None, gt=0)
     dietary_preferences: List[str] = Field(default_factory=list)
     interests: List[str] = Field(default_factory=list)
     trip_start_date: Optional[dt_date] = None
@@ -373,7 +372,7 @@ def extract_trip_slots(
         cand_lower = cand.lower()
         if cand_lower in CANONICAL_DESTINATIONS:
             dest_extracted = CANONICAL_DESTINATIONS[cand_lower]
-        elif len(cand) >= 2 and cand_lower not in {"a", "the", "it", "my", "our", "trip", "plan", "make"}:
+        elif len(cand) >= 2 and cand_lower not in {"a", "the", "it", "my", "our", "trip", "plan", "make", "walking", "driving", "transit", "cycling", "bike", "car", "cab"}:
             dest_extracted = cand.title()
 
     # B. Direct canonical dictionary matching if known Indian destination is explicitly present
@@ -382,7 +381,8 @@ def extract_trip_slots(
     if not dest_extracted:
         found_canonicals = []
         for alias, canonical in CANONICAL_DESTINATIONS.items():
-            if re.search(rf"\b{re.escape(alias)}\b", clean_lower):
+            match = re.search(rf"\b{re.escape(alias)}\b", clean_lower)
+            if match and not is_negated_match(match.span(), clean_lower):
                 if canonical not in found_canonicals:
                     found_canonicals.append(canonical)
         if len(found_canonicals) == 1:
@@ -473,18 +473,10 @@ def extract_trip_slots(
     # -------------------------------------------------------------------------
     # 8. Budget Extraction (supports 20k, 1.5L, 20000rs, etc.)
     # -------------------------------------------------------------------------
-    is_per_night = bool(re.search(r"\b(per night|/night|a night|nightly)\b", clean_lower))
-    is_total_budget = bool(re.search(r"\b(total|overall|complete|full)\b", clean_lower))
-    amount = parse_currency_amount(clean_lower)
-    if amount is not None:
-        if is_total_budget:
-            slots.hotel_total_budget = amount
-            slots.confidence["hotel_total_budget"] = SlotConfidence.HIGH
-            slots.explicit_fields.append("hotel_total_budget")
-        else:
-            slots.hotel_budget = amount
-            slots.confidence["hotel_budget"] = SlotConfidence.HIGH
-            slots.explicit_fields.append("hotel_budget")
+    for field, amount in extract_budget_slots(clean).items():
+        setattr(slots, field, amount)
+        slots.confidence[field] = SlotConfidence.HIGH
+        slots.explicit_fields.append(field)
 
     # -------------------------------------------------------------------------
     # 9. Date Extraction
@@ -504,3 +496,27 @@ def extract_trip_slots(
             slots.explicit_fields.append("trip_start_date")
 
     return slots
+
+
+def extract_budget_slots(message: str) -> Dict[str, float]:
+    """Scope monetary spans locally, without consuming dates or trip durations."""
+    updates: Dict[str, float] = {}
+    amount_pattern = r"(?:[₹$]\s*\d[\d,]*(?:\.\d+)?(?:\s*(?:k|lakh|lac|l))?\b|\b\d[\d,]*(?:\.\d+)?\s*(?:k|lakh|lac|l|rs|inr|rupees)\b|\b(?:rs\.?|inr)\s*\d[\d,]*(?:\.\d+)?\b)"
+    for clause in re.split(r"[;\n]|(?<!\d)\.(?!\d)|\band\b", message.lower()):
+        matches = list(re.finditer(amount_pattern, clause))
+        if not matches and re.search(r"\b(?:budget|per night|nightly)\b|/night", clause):
+            matches = list(re.finditer(r"\b\d[\d,]*(?:\.\d+)?\b", clause))
+            if len(matches) != 1:
+                continue
+        for match in matches:
+            amount = parse_currency_amount(match.group())
+            if amount is None:
+                continue
+            if re.search(r"\b(?:per night|a night|nightly)\b|/night", clause):
+                field = "hotel_budget"
+            elif re.search(r"\b(?:hotel|hotels|accommodation|stay)\b", clause):
+                field = "hotel_total_budget"
+            else:
+                field = "trip_budget"
+            updates[field] = amount
+    return updates

@@ -135,6 +135,12 @@ def format_state_context(state: TripState) -> str:
         lines.append(f"- Selected Hotel: {s['hotel']}")
     if s.get("hotel_budget"):
         lines.append(f"- Hotel Budget: ₹{s['hotel_budget']}/night")
+    if s.get("hotel_total_budget"):
+        lines.append(f"- Total Accommodation Budget: ₹{s['hotel_total_budget']}")
+    if s.get("trip_budget"):
+        lines.append(f"- Whole-Trip Budget: ₹{s['trip_budget']}")
+    for field in ("interests", "dietary_preferences", "explicit_fields", "derived_freshness"):
+        lines.append(f"- {field}: {getattr(state, field, s.get(field))}")
     if s.get("travel_mode"):
         lines.append(f"- Travel Mode: {s['travel_mode']}")
     if s.get("places"):

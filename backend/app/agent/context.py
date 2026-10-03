@@ -26,7 +26,7 @@ class ActiveQuestion(BaseModel):
     affirmation_value: Optional[Any] = Field(None, description="Value to apply if user responds 'yes'")
 
 
-from app.schemas.reference import EntityReference, VisibleItemReference
+from app.schemas.reference import VisibleItemReference
 
 
 class ConversationContext(BaseModel):
@@ -37,6 +37,9 @@ class ConversationContext(BaseModel):
     active_question: Optional[ActiveQuestion] = None
     last_agent_action: Optional[str] = None
     last_intent: Optional[str] = None
+    pending_actions: List[str] = Field(default_factory=list)
+    pending_turn: Optional[Dict[str, Any]] = None
+    pending_search_preferences: Dict[str, Any] = Field(default_factory=dict)
 
     # Result-set identity and visible card tracking
     visible_result_set_id: Optional[str] = None
@@ -337,6 +340,8 @@ def format_conversation_context(context: Optional[ConversationContext]) -> str:
     if not context:
         return ""
     lines = []
+    if context.pending_actions:
+        lines.append(f"\n[Requested Work Waiting for Prerequisites] {context.pending_actions}")
     if context.active_question:
         aq = context.active_question
         lines.append("\n[Active Clarification Question Waiting for Traveler's Answer]")
@@ -467,4 +472,3 @@ def clear_all_sessions() -> None:
     from app.agent.state import clear_all_states
     _SESSION_STORE.clear()
     clear_all_states()
-

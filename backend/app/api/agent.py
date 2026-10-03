@@ -6,15 +6,15 @@ FastAPI controller exposing POST /agent/chat for conversational trip planning.
 import re
 import time
 import logging
+from typing import List
 from uuid import UUID
-from typing import Optional, Callable
 from fastapi import APIRouter, HTTPException, Depends
 
 from app.schemas.agent import AgentChatRequest, AgentChatResponse
-from app.schemas.route import OptimizedRoute
-from app.agent.state import get_state, get_or_create_state, save_state, PlanningStage
+from app.agent.state import PlanningStage
 from app.agent.context import get_or_create_session, get_session, save_session
 from app.agent.fast_path import resolve_fast_path, FastPathResult
+from app.agent.turn_executor import execute_turn
 from app.agent.state_update import apply_trip_state_update, get_next_active_question
 from app.agent.dependencies import DerivedResource
 from app.agent.replanner import (
@@ -23,9 +23,11 @@ from app.agent.replanner import (
     execute_replanning_cycle,
 )
 from app.agent.planner import decide_next_planning_action, PlanningActionType
-from app.agent.tools import optimize_route_tool, search_restaurants_tool
+from app.agent.tools import search_restaurants_tool
 from app.agent.loop import AgentLoop, AgentLoopError, sanitize_public_response
 from app.llm.openrouter_client import (
+    OpenRouterClient,
+    LLMConfigError,
     LLMAuthError,
     LLMRateLimitError,
     LLMTimeoutError,
@@ -47,7 +49,7 @@ def _sanitize_error(msg: str) -> str:
 
 def get_agent_loop() -> AgentLoop:
     """Dependency provider returning an AgentLoop instance."""
-    return AgentLoop()
+    return AgentLoop(client=OpenRouterClient(lazy=True))
 
 
 @router.post(
@@ -102,6 +104,20 @@ def agent_chat(
     )
     fp_duration_ms = int((time.perf_counter() - t_fp_start) * 1000)
     logger.info(f"[FastPath] Evaluated in {fp_duration_ms}ms: matched={fp_result.matched}, intent={fp_result.intent}")
+
+    if fp_result.turn is not None:
+        outcome = execute_turn(fp_result.turn, session)
+        response_text = sanitize_public_response(outcome["response"])
+        state.messages.extend([{"role": "user", "content": request.message.strip()},
+                               {"role": "assistant", "content": response_text}])
+        save_session(session)
+        return AgentChatResponse(
+            conversation_id=UUID(state.conversation_id), response=response_text,
+            tool_calls=outcome["tool_calls"], iterations=0, state_summary=state.summary(),
+            results=outcome["results"], metrics={"total_turn_ms": int((time.perf_counter() - t_fp_start) * 1000),
+                "fast_path_ms": fp_duration_ms, "tool_count": len(outcome["tool_calls"]),
+                "fallback_trigger": fp_result.fallback_trigger, "fallback_succeeded": fp_result.fallback_succeeded},
+        )
 
     if fp_result.intent == "NON_TRIP_QUERY":
         response_text = "I can help plan a trip when you're ready. This message doesn't contain a trip-planning request."
@@ -876,6 +892,8 @@ def agent_chat(
                 user_message=request.message,
                 trip_state=state,
             )
+    except LLMConfigError as exc:
+        raise HTTPException(status_code=502, detail="LLM provider is not configured.") from exc
     except LLMAuthError as exc:
         logger.error(f"LLM Authentication error: {_sanitize_error(str(exc))}")
         raise HTTPException(

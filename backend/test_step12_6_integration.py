@@ -129,31 +129,14 @@ class TestStep12_6Milestone2Integration(unittest.TestCase):
         self.assertEqual(reloaded2.trip_state.hotel_total_budget, 3500.0)
         self.assertEqual(reloaded2.trip_state.hotel_budget, 875.0)
 
-        # Turn 3: User says "Actually Kashmir instead" (Nuanced pivot -> falls back to LLM)
-        # FastPath conservatively yields matched=False
+        # A clear destination correction does not need semantic fallback.
         fp_res3 = resolve_fast_path("Actually Kashmir instead", reloaded2)
-        self.assertFalse(fp_res3.matched)
-        self.assertEqual(fp_res3.intent, "FALLBACK_TO_LLM")
+        self.assertTrue(fp_res3.matched)
+        self.assertEqual(fp_res3.state_updates["destination"], "Kashmir")
 
-        # Mock loop handles the LLM turn and executes update_trip_state
-        from unittest.mock import MagicMock
         from app.api.agent import get_agent_loop
 
         mock_loop = MagicMock(spec=AgentLoop)
-        def fake_run(messages, user_message, trip_state, session=None, **kwargs):
-            # The agent tool call executes update_trip_state
-            apply_trip_state_update(session.trip_state, {"destination": "Kashmir"})
-            return AgentResult(
-                response="Got it — switching destination to Kashmir while keeping duration and budget.",
-                tool_calls=["update_trip_state"],
-                iterations=1,
-                state_summary=session.trip_state.summary(),
-                messages=messages + [
-                    {"role": "user", "content": user_message},
-                    {"role": "assistant", "content": "Got it — switching destination to Kashmir."},
-                ],
-            )
-        mock_loop.run.side_effect = fake_run
         app.dependency_overrides[get_agent_loop] = lambda: mock_loop
 
         res3 = self.client.post("/agent/chat", json={
@@ -161,6 +144,8 @@ class TestStep12_6Milestone2Integration(unittest.TestCase):
             "message": "Actually Kashmir instead",
         })
         self.assertEqual(res3.status_code, 200)
+        self.assertEqual(res3.json()["iterations"], 0)
+        mock_loop.run.assert_not_called()
 
         reloaded3 = get_session(cid)
         self.assertEqual(reloaded3.trip_state.destination, "Kashmir")
@@ -530,4 +515,3 @@ class TestStep12_6Milestone2Integration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

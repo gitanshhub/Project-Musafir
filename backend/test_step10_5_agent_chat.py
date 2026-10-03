@@ -9,7 +9,7 @@ import os
 import sys
 import uuid
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from main import app
 from app.api.agent import get_agent_loop
 from app.agent.loop import AgentLoop, AgentResult, AgentLoopError
+from app.agent.fast_path import FastPathResult
 from app.agent.state import clear_all_states, get_state
 from app.llm.openrouter_client import (
     LLMAuthError,
@@ -123,12 +124,10 @@ def test_existing_conversation_continuation():
         data2 = res2.json()
 
         assert data2["conversation_id"] == conv_id
-        assert data2["response"] == "Great, 3 days is perfect for exploring the palaces."
-
-        # Verify second call to loop received prior messages
-        call_args_turn2 = mock_loop.run.call_args_list[1][1]
-        assert len(call_args_turn2["messages"]) == 2
-        assert call_args_turn2["messages"][0]["content"] == "I want to visit Jaipur."
+        assert data2["state_summary"]["destination"] == "Jaipur"
+        assert data2["state_summary"]["number_of_days"] == 3
+        assert data2["iterations"] == 0
+        mock_loop.run.assert_not_called()
         print(f"  ✓ Session {conv_id} successfully continued across turns.")
         print("  ✓ Test 2 Passed!")
     finally:
@@ -222,7 +221,8 @@ def test_agent_response_with_tools():
     app.dependency_overrides[get_agent_loop] = lambda: mock_loop
 
     try:
-        res = client.post("/agent/chat", json={"message": "Find places and restaurants in Jaipur."})
+        with patch("app.api.agent.resolve_fast_path", return_value=FastPathResult(matched=False)):
+            res = client.post("/agent/chat", json={"message": "Find places and restaurants in Jaipur."})
         assert res.status_code == 200
         data = res.json()
         assert data["tool_calls"] == ["search_places", "search_restaurants"]
@@ -341,7 +341,9 @@ def test_state_persistence():
         persisted = get_state(conv_id)
         assert persisted is not None
         assert persisted.destination == "Jaipur"
-        assert persisted.hotel_budget == 4000.0
+        assert persisted.trip_budget == 4000.0
+        assert persisted.hotel_budget is None
+        mock_loop.run.assert_not_called()
         print("  ✓ TripState mutations properly preserved in repository.")
         print("  ✓ Test 13 Passed!")
     finally:
@@ -405,7 +407,8 @@ def test_conversation_history_sequencing():
 
     try:
         # Turn 1
-        res1 = client.post("/agent/chat", json={"message": "Find hotels in Jaipur"})
+        with patch("app.api.agent.resolve_fast_path", return_value=FastPathResult(matched=False)):
+            res1 = client.post("/agent/chat", json={"message": "Find hotels in Jaipur"})
         assert res1.status_code == 200
         conv_id = res1.json()["conversation_id"]
 
@@ -465,7 +468,8 @@ def test_tool_call_metadata_sanitation():
     app.dependency_overrides[get_agent_loop] = lambda: mock_loop
 
     try:
-        res = client.post("/agent/chat", json={"message": "Hotels in Jaipur"})
+        with patch("app.api.agent.resolve_fast_path", return_value=FastPathResult(matched=False)):
+            res = client.post("/agent/chat", json={"message": "Hotels in Jaipur"})
         data = res.json()
         assert data["tool_calls"] == ["search_hotels"]
         # Ensure raw parameters and raw tool result dicts are NOT leaked in response

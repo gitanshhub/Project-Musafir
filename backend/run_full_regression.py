@@ -39,6 +39,8 @@ NON_LIVE_SUITES = [
     "validate_phase_a.py",
     "validate_phases_b_to_e.py",
     "test_m3_2_design_fixes.py",
+    "test_m3_2_llm_fallback.py",
+    "test_context_turn_pipeline.py",
 ]
 
 

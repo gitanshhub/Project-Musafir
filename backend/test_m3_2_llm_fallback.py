@@ -58,7 +58,7 @@ class TestM32LLMFallback(unittest.TestCase):
             '{"process_as_trip": true, "slots": {"number_of_days": 2}, '
             '"confidence": {"number_of_days": "HIGH"}}'
         )
-        result = resolve_fast_path("Weekend getaway in Goa", session, llm_client=client)
+        result = resolve_fast_path("A short getaway in Goa", session, llm_client=client)
         self.assertTrue(result.matched)
         self.assertEqual(result.state_updates["number_of_days"], 2)
         self.assertEqual(client.calls, 1)
@@ -66,7 +66,7 @@ class TestM32LLMFallback(unittest.TestCase):
     def test_fallback_failure_does_not_raise(self):
         session = SessionState(conversation_id="test")
         client = FakeClient(error=LLMProviderError("provider unavailable"))
-        result = resolve_fast_path("Quick trip to Kochi", session, llm_client=client)
+        result = resolve_fast_path("I have a free Sunday in Kochi", session, llm_client=client)
         self.assertIsNotNone(result)
         self.assertEqual(client.calls, 1)
 
