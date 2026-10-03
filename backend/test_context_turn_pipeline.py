@@ -14,10 +14,13 @@ from app.agent.context import clear_all_sessions, get_or_create_session, get_ses
 from app.agent.fast_path import resolve_fast_path
 from app.agent.llm_extraction import _parse_response
 from app.agent.loop import AgentLoop
+from app.agent.replanner import ReplanningAction, ReplanningActionType
 from app.agent.state_update import apply_trip_state_update
-from app.agent.turn import InterpretedTurn, ReferenceEdit
+from app.agent.turn import InterpretedTurn, ReferenceEdit, interpret_complete_turn
 from app.agent.turn_executor import execute_turn
 from app.llm.openrouter_client import LLMProviderError, LLMResponse
+from app.schemas.itinerary import ItineraryResponse
+from app.schemas.route import OptimizedRoute
 
 HOTEL = {
     "name": "City Hotel",
@@ -164,6 +167,103 @@ class ContextTurnTests(unittest.TestCase):
         )
         self.assertEqual(session.trip_state.number_of_days, 5)
         self.assertEqual(reply["tool_calls"], ["search_hotels"])
+
+    def test_cancel_clears_pending_search(self):
+        reply = self.chat("Find hotels in Jaipur")
+        session = get_session(reply["conversation_id"])
+        self.assertEqual(
+            session.conversation_context.pending_actions, ["SEARCH_HOTELS"]
+        )
+        reply = self.chat("cancel", session.conversation_id)
+        self.assertEqual(reply["response"], "Canceled.")
+        self.assertEqual(session.conversation_context.pending_actions, [])
+        self.hotels.assert_not_called()
+
+    def test_coordinated_selection_keeps_route_request(self):
+        session = self.ready_session()
+        session.conversation_context.set_visible_items("place", [PLACE, SECOND_PLACE])
+        result = resolve_fast_path("select second place and build route", session)
+        self.assertEqual(result.turn.requested_actions, ["ROUTE_REQUEST"])
+        self.assertEqual(result.turn.references[0].reference, "second")
+
+    def test_multiple_hotel_budgets_keep_distinct_scopes(self):
+        turn = interpret_complete_turn(
+            "₹3000 per night, ₹9000 total hotel", self.ready_session()
+        )
+        self.assertEqual(turn.updates["hotel_budget"], 3000)
+        self.assertEqual(turn.updates["hotel_total_budget"], 9000)
+
+    def test_fallback_preserves_explicit_hotel_requirement(self):
+        session = get_or_create_session()
+        apply_trip_state_update(
+            session.trip_state,
+            {
+                "destination": "Jaipur",
+                "number_of_days": 1,
+                "accommodation_required": False,
+                "explicit_fields": ["accommodation_required"],
+            },
+        )
+        self.provider.payload = {
+            "process_as_trip": True,
+            "slots": {"destination": "Goa"},
+            "confidence": {"destination": "HIGH"},
+        }
+        result = resolve_fast_path(
+            "find hotels in Goa, but not Jaipur", session, self.provider
+        )
+        self.assertIn("SEARCH_HOTELS", result.turn.requested_actions)
+        self.assertTrue(result.turn.updates["accommodation_required"])
+        self.assertFalse(result.turn.updates["accommodation_booked"])
+
+    def test_implicit_duration_answer_resumes_pending_plan(self):
+        self.provider.error = LLMProviderError("provider unavailable")
+        reply = self.chat("Plan a short getaway in Jaipur")
+        session = get_session(reply["conversation_id"])
+        self.assertEqual(
+            session.conversation_context.active_question.field, "number_of_days"
+        )
+        self.chat("3 days", session.conversation_id)
+        self.assertEqual(session.trip_state.number_of_days, 3)
+        self.assertNotEqual(
+            getattr(session.conversation_context.active_question, "field", None),
+            "number_of_days",
+        )
+
+    def test_replanning_actions_return_structured_results(self):
+        session = self.ready_session()
+        route = OptimizedRoute(
+            ordered_stops=[],
+            segments=[],
+            total_distance_meters=0,
+            total_duration_seconds=0,
+            score=1,
+        )
+        itinerary = ItineraryResponse(
+            days=[],
+            total_days=0,
+            total_distance_meters=0,
+            total_travel_seconds=0,
+            total_visit_minutes=0,
+        )
+        for action, attribute, key, value in (
+            ("ROUTE_REQUEST", "current_route", "route", route),
+            ("ITINERARY_REQUEST", "current_itinerary", "itinerary", itinerary),
+        ):
+            with self.subTest(action=action):
+                setattr(session.trip_state, attribute, value)
+                decision = ReplanningAction(
+                    action_type=ReplanningActionType.ANSWER,
+                    reason="Current plan is valid.",
+                )
+                with patch(
+                    "app.agent.turn_executor.ReplanningController.decide",
+                    return_value=decision,
+                ):
+                    outcome = execute_turn(
+                        InterpretedTurn(requested_actions=[action]), session
+                    )
+                self.assertIn(key, outcome["results"])
 
     def test_relative_duration_is_contextual_and_deterministic(self):
         session = self.ready_session()
@@ -513,6 +613,9 @@ class ContextTurnTests(unittest.TestCase):
         self.assertIsNone(reply["results"])
         self.assertNotIn("Here are", reply["response"])
         self.assertEqual(session.conversation_context.visible_places, [])
+        self.assertEqual(
+            session.trip_state.get_derived_status("place_discovery").value, "stale"
+        )
 
     def test_new_start_date_moves_derived_end_date(self):
         session = self.ready_session()

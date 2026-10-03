@@ -67,13 +67,21 @@ def resolve_fast_path(
     if re.search(r"\b(?:more relaxed|slower pace|less crowded|same budget|best places)\b", user_message.lower()):
         return FastPathResult(matched=False, explanation="The complete request requires semantic interpretation.")
     entity_command = re.match(r"^(?:remove|drop|replace|change|switch|mark|must visit|keep|pick|select)\b", user_message.lower())
-    compound_change = re.search(r"[,;]|\b(?:days?|walking|driving|cycling|transit|budget)\b", user_message.lower())
-    if entity_command and not compound_change:
-        result = _resolve_single_intent(user_message, session, None)
-        if result.matched:
-            return result
+    compound_change = re.search(
+        r"[,;]|\b(?:days?|walking|driving|cycling|transit|budget)\b|\b(?:and|then)\b.*\b(?:find|search|show|build|create|route|itinerary|plan)\b",
+        user_message.lower(),
+    )
+    entity_result = None
+    if entity_command:
+        entity_result = _resolve_single_intent(user_message, session, None)
+        if entity_result.matched and (
+            not compound_change or entity_result.intent == "REPLACE_ITEM"
+        ):
+            return entity_result
     turn = interpret_complete_turn(user_message, session)
     if turn:
+        if entity_result and entity_result.matched and not turn.references:
+            turn.updates = {**entity_result.state_updates, **turn.updates}
         extracted = extract_trip_slots(user_message, session.trip_state)
         trigger = detect_fallback_trigger(user_message, extracted, session.trip_state)
         fallback = None
@@ -87,7 +95,13 @@ def resolve_fast_path(
                 if fallback.process_as_trip is False:
                     return FastPathResult(matched=True, intent="NON_TRIP_QUERY", process_as_trip=False)
                 merged = merge_fallback_slots(extracted, fallback.slots, trigger.suspicious_fields)
-                turn.updates = merged.high_confidence_updates()
+                corrected_updates = merged.high_confidence_updates()
+                action_requirements = {
+                    field: turn.updates[field]
+                    for field in ("accommodation_required", "accommodation_booked")
+                    if field in turn.updates
+                }
+                turn.updates = {**action_requirements, **corrected_updates}
                 turn.updates["explicit_fields"] = list(turn.updates)
                 for field in type(fallback.semantics).model_fields:
                     value = getattr(fallback.semantics, field)
@@ -95,6 +109,10 @@ def resolve_fast_path(
                         setattr(turn, field, value)
             else:
                 turn.clarification = "How many days should the trip be?" if implicit_duration else "Could you clarify the destination or accommodation change you want?"
+                if implicit_duration:
+                    session.conversation_context.set_active_question(
+                        "number_of_days", "number", "trip", turn.clarification
+                    )
         intent = "PLAN_TRIP" if ("destination" in turn.updates or "number_of_days" in turn.updates) else "UPDATE_FIELD"
         if session.trip_state.number_of_days and "number_of_days" in turn.updates and "destination" not in turn.updates:
             intent = "UPDATE_DURATION"

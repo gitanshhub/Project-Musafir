@@ -23,6 +23,12 @@ from app.agent.turn import InterpretedTurn, resolve_turn_references
 def execute_turn(turn: InterpretedTurn, session: SessionState) -> Dict[str, Any]:
     state, context = session.trip_state, session.conversation_context
     turn = resolve_turn_references(turn, session)
+    if turn.cancelled:
+        context.pending_actions = []
+        context.pending_search_preferences = {}
+        context.pending_turn = None
+        context.clear_active_question()
+        return {"response": "Canceled.", "tool_calls": [], "results": None}
     if turn.clarification:
         context.pending_turn = turn.model_dump()
         return {"response": turn.clarification, "tool_calls": [], "results": None}
@@ -152,6 +158,12 @@ def execute_turn(turn: InterpretedTurn, session: SessionState) -> Dict[str, Any]
                         if action == "ROUTE_REQUEST"
                         else "Your daily itinerary is updated."
                     )
+            if action == "ROUTE_REQUEST" and state.current_route:
+                results["route"] = state.current_route.model_dump()
+            if action == "ITINERARY_REQUEST" and state.current_itinerary:
+                results["itinerary"] = state.current_itinerary.model_dump()
+            if state.feasibility_result:
+                results["feasibility"] = state.feasibility_result.model_dump()
         else:
             if not state.destination or is_broad_destination(state.destination):
                 break
@@ -255,9 +267,11 @@ def execute_turn(turn: InterpretedTurn, session: SessionState) -> Dict[str, Any]
                 outcome = {"success": False}
             if state.state_version != version:
                 results.clear()
-                for field, cards in published_cards.items():
+                for field, published in published_cards.items():
+                    cards, resource = published
                     if getattr(context, field) is cards:
                         setattr(context, field, [])
+                        state.mark_derived_stale(resource)
                 if context.pending_actions is pending_queue:
                     context.pending_actions = completed_searches + pending_queue
                 replies = [
@@ -278,7 +292,10 @@ def execute_turn(turn: InterpretedTurn, session: SessionState) -> Dict[str, Any]
             items = outcome.get(key, [])
             context.set_visible_items(entity, items)
             visible_field = f"visible_{key}"
-            published_cards[visible_field] = getattr(context, visible_field)
+            published_cards[visible_field] = (
+                getattr(context, visible_field),
+                resource,
+            )
             completed_searches.append(action)
             state.planning_stage = stage
             results[key] = items
