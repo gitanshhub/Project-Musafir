@@ -141,7 +141,7 @@ def extract_actions(message: str) -> List[ActionName]:
 
 
 def interpret_complete_turn(
-    message: str, session: SessionState
+    message: str, session: SessionState, *, slot_message: Optional[str] = None
 ) -> Optional[InterpretedTurn]:
     """Resolve explicit multi-part turns before any single-intent early return."""
     text = message.lower().strip()
@@ -219,7 +219,9 @@ def interpret_complete_turn(
         return None
     if re.search(r"\b(?:more relaxed|slower pace|less crowded|same budget)\b", text):
         return None
-    slots = extract_trip_slots(message, session.trip_state)
+    slots = extract_trip_slots(
+        slot_message if slot_message is not None else message, session.trip_state
+    )
     updates = slots.high_confidence_updates()
     date_range = parse_date_range(message)
     if date_range:

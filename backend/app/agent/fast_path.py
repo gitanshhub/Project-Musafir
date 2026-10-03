@@ -21,7 +21,12 @@ from app.agent.semantics import (
     calculate_nightly_hotel_budget,
 )
 from app.agent.extraction import extract_trip_slots
-from app.agent.turn import InterpretedTurn, interpret_complete_turn
+from app.agent.turn import (
+    InterpretedTurn,
+    ReferenceEdit,
+    extract_actions,
+    interpret_complete_turn,
+)
 from app.agent.llm_extraction import detect_fallback_trigger, merge_fallback_slots, run_fallback
 from app.llm.openrouter_client import OpenRouterClient
 from app.agent.resolution import (
@@ -66,23 +71,58 @@ def resolve_fast_path(
 ) -> FastPathResult:
     if re.search(r"\b(?:more relaxed|slower pace|less crowded|same budget|best places)\b", user_message.lower()):
         return FastPathResult(matched=False, explanation="The complete request requires semantic interpretation.")
-    entity_command = re.match(r"^(?:remove|drop|replace|change|switch|mark|must visit|keep|pick|select)\b", user_message.lower())
+    entity_command = re.match(r"^(?:remove|drop|replace|swap|substitute|change|switch|mark|must visit|keep|pick|select)\b", user_message.lower())
     compound_change = re.search(
         r"[,;]|\b(?:days?|walking|driving|cycling|transit|budget)\b|\b(?:and|then)\b.*\b(?:find|search|show|build|create|route|itinerary|plan)\b",
         user_message.lower(),
     )
     entity_result = None
+    entity_clause = re.split(
+        r"(?:[,;]\s*|\s+(?:and|then)\s+)(?=(?:find|search|show|build|rebuild|create|generate|plan|increase|decrease|reduce|extend|change|switch|update|make|set|add|remove|select|pick)\b)",
+        user_message,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     if entity_command:
-        entity_result = _resolve_single_intent(user_message, session, None)
-        if entity_result.matched and (
-            not compound_change or entity_result.intent == "REPLACE_ITEM"
-        ):
+        entity_result = _resolve_single_intent(entity_clause, session, None)
+        if entity_result.matched and not compound_change:
             return entity_result
-    turn = interpret_complete_turn(user_message, session)
+    slot_message = (
+        user_message[len(entity_clause):]
+        if entity_command and entity_clause != user_message
+        else user_message
+    )
+    turn = interpret_complete_turn(user_message, session, slot_message=slot_message)
+    if not turn and entity_result and entity_result.matched and entity_clause != user_message:
+        turn = InterpretedTurn(requested_actions=extract_actions(user_message))
     if turn:
-        if entity_result and entity_result.matched and not turn.references:
+        replacement = re.fullmatch(
+            r"(?:replace|swap|substitute)\s+(.+?)\s+(?:with|for)\s+(.+)",
+            entity_clause, re.IGNORECASE,
+        )
+        hotel_change = re.fullmatch(
+            r"(?:change|switch|update|swap)\s+(?:my\s+|the\s+)?hotel\s+(?:to|for)\s+(.+)",
+            entity_clause, re.IGNORECASE,
+        )
+        if entity_command and compound_change and replacement:
+            target = (
+                (entity_result.reference_resolution or {}).get("target", {})
+                if entity_result else {}
+            )
+            entity_type = target.get("entity_type", "place")
+            turn.references = [
+                ReferenceEdit(operation="remove", entity_type=entity_type, reference=replacement.group(1).strip()),
+                ReferenceEdit(operation="select", entity_type=entity_type, reference=replacement.group(2).strip()),
+                *turn.references,
+            ]
+        elif entity_command and compound_change and hotel_change:
+            turn.references = [
+                ReferenceEdit(operation="select", entity_type="hotel", reference=hotel_change.group(1).strip()),
+                *turn.references,
+            ]
+        elif entity_result and entity_result.matched and not turn.references:
             turn.updates = {**entity_result.state_updates, **turn.updates}
-        extracted = extract_trip_slots(user_message, session.trip_state)
+        extracted = extract_trip_slots(slot_message, session.trip_state)
         trigger = detect_fallback_trigger(user_message, extracted, session.trip_state)
         fallback = None
         short_destination = bool(extracted.destination and re.fullmatch(r"(?:to\s+|in\s+|actually\s+|actually\s+make\s+it\s+|make\s+it\s+|switch\s+to\s+|change\s+to\s+)?" + re.escape(extracted.destination.lower()) + r"(?:\s+instead)?", user_message.strip().lower()))
@@ -120,7 +160,11 @@ def resolve_fast_path(
             intent = turn.requested_actions[0]
         if "number_of_days" in turn.updates and "number_of_nights" not in turn.updates:
             turn.updates["number_of_nights"] = max(0, turn.updates["number_of_days"] - 1)
-        if "hotel_total_budget" in turn.updates:
+        if (
+            "hotel_total_budget" in turn.updates
+            and "hotel_budget" not in turn.updates
+            and "hotel_budget" not in session.trip_state.explicit_fields
+        ):
             nights = turn.updates.get("number_of_nights", session.trip_state.number_of_nights)
             if nights:
                 turn.updates["hotel_budget"] = round(turn.updates["hotel_total_budget"] / nights, 2)

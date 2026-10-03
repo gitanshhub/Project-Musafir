@@ -95,6 +95,7 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
     change_set = TripChangeSet()
     if not updates or not isinstance(updates, dict):
         return change_set
+    derive_nightly_budget = "hotel_budget" not in updates and "hotel_budget" not in state.explicit_fields
 
     # Synchronize derived_freshness if route or itinerary was assigned directly without marking
     if state.current_route is not None and state.get_derived_status(DerivedResource.CURRENT_ROUTE) == DerivedStateStatus.NOT_AVAILABLE:
@@ -150,7 +151,7 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                         state.number_of_nights = derived_nights
 
                 # If hotel_total_budget is known, derive or update nightly hotel budget ceiling
-                if state.hotel_total_budget and state.number_of_nights:
+                if derive_nightly_budget and state.hotel_total_budget and state.number_of_nights:
                     derived_rate = calculate_nightly_hotel_budget(
                         total_hotel_budget=state.hotel_total_budget,
                         explicit_nights=state.number_of_nights,
@@ -170,7 +171,7 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                 change_set.new_values["number_of_nights"] = new_nights
                 state.number_of_nights = new_nights
 
-                if state.hotel_total_budget:
+                if derive_nightly_budget and state.hotel_total_budget:
                     derived_rate = calculate_nightly_hotel_budget(
                         total_hotel_budget=state.hotel_total_budget,
                         explicit_nights=new_nights,
@@ -218,7 +219,7 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
         # Recalculate nightly hotel budget ceiling
         if state.number_of_nights == 0:
             state.hotel_budget = None
-        elif state.hotel_total_budget and state.number_of_nights:
+        elif derive_nightly_budget and state.hotel_total_budget and state.number_of_nights:
             derived_rate = calculate_nightly_hotel_budget(
                 total_hotel_budget=state.hotel_total_budget,
                 explicit_nights=state.number_of_nights,
@@ -293,7 +294,7 @@ def apply_trip_state_update(state: TripState, updates: Dict[str, Any]) -> TripCh
                     nights = calculate_nights(start_date=state.trip_start_date, end_date=state.trip_end_date)
                     state.number_of_nights = nights
 
-                if nights and nights > 0:
+                if derive_nightly_budget and nights and nights > 0:
                     derived_rate = calculate_nightly_hotel_budget(
                         total_hotel_budget=new_total,
                         explicit_nights=nights,

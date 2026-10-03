@@ -193,6 +193,87 @@ class ContextTurnTests(unittest.TestCase):
         self.assertEqual(turn.updates["hotel_budget"], 3000)
         self.assertEqual(turn.updates["hotel_total_budget"], 9000)
 
+    def test_explicit_nightly_cap_survives_total_budget_search_and_later_edits(self):
+        session = self.ready_session()
+        self.chat(
+            "₹2000 per night, ₹9000 total hotel, find hotels", session.conversation_id
+        )
+        self.assertEqual(session.trip_state.hotel_budget, 2000)
+        self.assertEqual(session.trip_state.hotel_total_budget, 9000)
+        self.assertEqual(self.hotels.call_args.kwargs["max_price"], 2000)
+        self.chat("make it 5 days", session.conversation_id)
+        self.assertEqual(session.trip_state.hotel_budget, 2000)
+        self.assertEqual(session.trip_state.hotel_total_budget, 9000)
+        self.chat("find hotels", session.conversation_id)
+        self.assertEqual(self.hotels.call_args.kwargs["max_price"], 2000)
+
+    def test_nightly_change_set_and_selected_hotel_use_explicit_cap(self):
+        session = self.ready_session()
+        apply_trip_state_update(
+            session.trip_state, {"hotel_selection": {**HOTEL, "price_per_night": 1500}}
+        )
+        change = apply_trip_state_update(
+            session.trip_state, {"hotel_budget": 2000, "hotel_total_budget": 12000}
+        )
+        self.assertEqual(change.new_values["hotel_budget"], 2000)
+        self.assertEqual(session.trip_state.hotel_budget, 2000)
+        self.assertEqual(session.trip_state.hotel_selection.name, HOTEL["name"])
+
+    def test_replacement_preserves_coordinated_budget_change(self):
+        session = self.ready_session()
+        apply_trip_state_update(session.trip_state, {"selected_places": [PLACE]})
+        session.conversation_context.set_visible_items("place", [PLACE, SECOND_PLACE])
+        self.chat(
+            "replace Amber Fort with Jal Mahal and increase budget to ₹10000",
+            session.conversation_id,
+        )
+        self.assertEqual(session.trip_state.trip_budget, 10000)
+        self.assertEqual(
+            [p.name for p in session.trip_state.selected_places], ["Jal Mahal"]
+        )
+        self.assertEqual(
+            session.trip_state.selected_places[0].latitude, SECOND_PLACE["latitude"]
+        )
+
+    def test_replacement_preserves_coordinated_duration_change(self):
+        session = self.ready_session()
+        apply_trip_state_update(session.trip_state, {"selected_places": [PLACE]})
+        session.conversation_context.set_visible_items("place", [PLACE, SECOND_PLACE])
+        self.chat(
+            "replace Amber Fort with Jal Mahal and make it 3 days",
+            session.conversation_id,
+        )
+        self.assertEqual(session.trip_state.number_of_days, 3)
+        self.assertEqual(
+            [p.name for p in session.trip_state.selected_places], ["Jal Mahal"]
+        )
+
+    def test_unknown_replacement_clarifies_before_applying_budget(self):
+        session = self.ready_session()
+        apply_trip_state_update(session.trip_state, {"selected_places": [PLACE]})
+        session.conversation_context.set_visible_items("place", [PLACE, SECOND_PLACE])
+        self.chat(
+            "replace Amber Fort with Unknown Palace and increase budget to ₹10000",
+            session.conversation_id,
+        )
+        self.assertIsNone(session.trip_state.trip_budget)
+        self.assertEqual(
+            [p.name for p in session.trip_state.selected_places], ["Amber Fort"]
+        )
+        self.chat("second", session.conversation_id)
+        self.assertEqual(session.trip_state.trip_budget, 10000)
+        self.assertEqual(
+            [p.name for p in session.trip_state.selected_places], ["Jal Mahal"]
+        )
+
+    def test_coordinated_hotel_selection_uses_visible_identity(self):
+        session = self.ready_session()
+        session.conversation_context.set_visible_items("hotel", [HOTEL])
+        self.chat("change hotel to City Hotel, find places", session.conversation_id)
+        self.assertEqual(session.trip_state.hotel_selection.name, "City Hotel")
+        self.assertEqual(session.trip_state.hotel_selection.latitude, HOTEL["latitude"])
+        self.places.assert_called_once()
+
     def test_fallback_preserves_explicit_hotel_requirement(self):
         session = get_or_create_session()
         apply_trip_state_update(
