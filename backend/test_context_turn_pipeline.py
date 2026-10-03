@@ -12,6 +12,7 @@ from main import app
 from app.api.agent import get_agent_loop
 from app.agent.context import clear_all_sessions, get_or_create_session, get_session
 from app.agent.fast_path import resolve_fast_path
+from app.agent.feasibility import FeasibilityEngine
 from app.agent.llm_extraction import _parse_response
 from app.agent.loop import AgentLoop
 from app.agent.replanner import ReplanningAction, ReplanningActionType
@@ -20,6 +21,7 @@ from app.agent.turn import InterpretedTurn, ReferenceEdit, interpret_complete_tu
 from app.agent.turn_executor import execute_turn
 from app.llm.openrouter_client import LLMProviderError, LLMResponse
 from app.schemas.itinerary import ItineraryResponse
+from app.schemas.hotel import Hotel
 from app.schemas.route import OptimizedRoute
 
 HOTEL = {
@@ -219,6 +221,64 @@ class ContextTurnTests(unittest.TestCase):
         self.assertEqual(session.trip_state.hotel_budget, 2000)
         self.assertEqual(session.trip_state.hotel_selection.name, HOTEL["name"])
 
+    def test_total_hotel_budget_limits_search_without_overwriting_nightly_cap(self):
+        session = self.ready_session()
+        self.chat(
+            "5 days, ₹3000 per night, ₹6000 total hotel, find hotels",
+            session.conversation_id,
+        )
+        self.assertEqual(session.trip_state.hotel_budget, 3000)
+        self.assertEqual(session.trip_state.hotel_total_budget, 6000)
+        self.assertEqual(self.hotels.call_args.kwargs["max_price"], 1500)
+
+    def test_hotel_feasibility_enforces_total_stay_budget(self):
+        session = self.ready_session()
+        apply_trip_state_update(
+            session.trip_state,
+            {
+                "number_of_days": 5,
+                "hotel_budget": 3000,
+                "hotel_total_budget": 6000,
+                "hotel_selection": {**HOTEL, "price_per_night": 2500},
+            },
+        )
+        violations = []
+        FeasibilityEngine._evaluate_budget(session.trip_state, violations)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].required_value, 1500)
+        self.assertIn("6,000 total over 4 nights", violations[0].explanation)
+        self.assertEqual(session.trip_state.hotel_budget, 3000)
+
+    def test_direct_hotel_tool_applies_total_budget_to_requested_stay(self):
+        from app.agent.tools import search_hotels_tool
+
+        session = self.ready_session()
+        apply_trip_state_update(
+            session.trip_state, {"hotel_budget": 3000, "hotel_total_budget": 6000}
+        )
+        with (
+            patch("app.agent.tools._get_api_key", return_value="offline-test"),
+            patch("app.agent.tools.fetch_hotels_from_serpapi", return_value={}),
+            patch(
+                "app.agent.tools.normalize_hotels_response",
+                return_value=[
+                    Hotel(**{**HOTEL, "price_per_night": 1500}),
+                    Hotel(
+                        **{**HOTEL, "name": "Too Expensive", "price_per_night": 2500}
+                    ),
+                ],
+            ),
+        ):
+            result = search_hotels_tool(
+                destination="Jaipur",
+                check_in="2026-11-24",
+                check_out="2026-11-28",
+                max_price=3000,
+                trip_state=session.trip_state,
+            )
+        self.assertTrue(result["success"], result)
+        self.assertEqual([h["name"] for h in result["hotels"]], [HOTEL["name"]])
+
     def test_replacement_preserves_coordinated_budget_change(self):
         session = self.ready_session()
         apply_trip_state_update(session.trip_state, {"selected_places": [PLACE]})
@@ -273,6 +333,20 @@ class ContextTurnTests(unittest.TestCase):
         self.assertEqual(session.trip_state.hotel_selection.name, "City Hotel")
         self.assertEqual(session.trip_state.hotel_selection.latitude, HOTEL["latitude"])
         self.places.assert_called_once()
+
+    def test_hotel_budget_between_entity_and_search_clauses_is_retained(self):
+        for message in (
+            "change hotel to City Hotel, ₹2000 per night, find hotels",
+            "change hotel to City Hotel and ₹2000 per night and find hotels",
+        ):
+            with self.subTest(message=message):
+                session = self.ready_session()
+                session.conversation_context.set_visible_items("hotel", [HOTEL])
+                self.chat(message, session.conversation_id)
+                self.assertEqual(session.trip_state.hotel_selection.name, HOTEL["name"])
+                self.assertEqual(session.trip_state.destination, "Jaipur")
+                self.assertEqual(session.trip_state.hotel_budget, 2000)
+                self.assertEqual(self.hotels.call_args.kwargs["max_price"], 2000)
 
     def test_fallback_preserves_explicit_hotel_requirement(self):
         session = get_or_create_session()

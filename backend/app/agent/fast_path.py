@@ -78,11 +78,12 @@ def resolve_fast_path(
     )
     entity_result = None
     entity_clause = re.split(
-        r"(?:[,;]\s*|\s+(?:and|then)\s+)(?=(?:find|search|show|build|rebuild|create|generate|plan|increase|decrease|reduce|extend|change|switch|update|make|set|add|remove|select|pick)\b)",
+        r"[,;](?!\d)|\s+(?:and|then)\s+(?=(?:find|search|show|build|rebuild|create|generate|plan|increase|decrease|reduce|extend|change|switch|update|make|set|add|remove|select|pick|budget|hotel budget|trip budget|rs|inr|one|two|three|four|five|walking|driving|cycling|transit)\b|[₹$]|\d)",
         user_message,
         maxsplit=1,
         flags=re.IGNORECASE,
     )[0]
+    compound_change = compound_change or entity_clause != user_message
     if entity_command:
         entity_result = _resolve_single_intent(entity_clause, session, None)
         if entity_result.matched and not compound_change:

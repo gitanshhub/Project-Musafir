@@ -187,7 +187,7 @@ def execute_turn(turn: InterpretedTurn, session: SessionState) -> Dict[str, Any]
                     "check_out": (
                         state.trip_start_date + timedelta(days=state.number_of_nights)
                     ).isoformat(),
-                    "max_price": state.hotel_budget,
+                    "max_price": state.effective_hotel_budget,
                 }
             elif action == "SEARCH_PLACES":
                 name, key, entity, stage = (
